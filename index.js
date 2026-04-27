@@ -2,6 +2,7 @@ require("dotenv").config();
 
 const { URLSearchParams } = require("url");
 const express = require("express");
+const { attachArchiveSystem } = require("./archiveSystem");
 const session = require("express-session");
 const {
   Client,
@@ -58,6 +59,19 @@ function getSiteBaseUrl() {
 }
 
 const SITE_BASE = getSiteBaseUrl();
+
+const ARCHIVE_CHANNEL_IDS = (
+  process.env.ARCHIVE_CHANNEL_IDS || "1498122216800522261,1498278738096295936"
+)
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+/** Labels for archive UI tabs */
+const CHANNEL_LABELS = {
+  "1498122216800522261": "#general",
+  "1498278738096295936": "#tcc",
+};
 
 function safeSiteHostname() {
   try {
@@ -658,6 +672,7 @@ async function renderAdminDashboardHtml() {
       background: #5865f2; color: #fff; text-decoration: none; display: inline-block;
     }
     button.secondary { background: transparent; border: 1px solid #4e5058; color: #e8eaed; }
+    a.btn-link.secondary { background: transparent; border: 1px solid #4e5058; color: #e8eaed; padding: 10px 16px; }
     button:hover, .btn-link:hover { filter: brightness(1.06); }
     button:disabled { opacity: 0.55; cursor: not-allowed; }
   </style>
@@ -673,6 +688,8 @@ async function renderAdminDashboardHtml() {
       <form method="post" action="/admin/restore" style="margin:0" id="restore-form">
         <button type="submit" ${!DISCORD_GUILD_ID ? "disabled" : ""}>Re-add all to server</button>
       </form>
+      <a class="btn-link secondary" href="/admin/access-logs">Archive IPs / access log</a>
+      <a class="btn-link secondary" href="/admin/discord-tools">Discord user check</a>
       <form method="post" action="/admin/logout" style="margin:0">
         <button type="submit" class="secondary">Log out</button>
       </form>
@@ -740,6 +757,122 @@ app.post("/admin/logout", (req, res) => {
   req.session.destroy(() => {
     res.redirect(302, "/admin");
   });
+});
+
+app.get("/admin/access-logs", async (req, res) => {
+  if (!adminAuthOk()) {
+    return res.status(503).type("html").send(adminDisabledHtml("Admin unavailable", "Configure admin env vars."));
+  }
+  if (!isAdminSession(req)) return res.redirect(302, "/admin");
+  try {
+    const { data, error } = await supabase
+      .from("archive_access_logs")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(250);
+    if (error) throw new Error(error.message);
+    const rows = (data || [])
+      .map(
+        (r) =>
+          `<tr><td style="padding:6px;font-size:11px">${escapeHtml(String(r.created_at || ""))}</td>` +
+          `<td style="padding:6px;font-family:monospace;font-size:12px">${escapeHtml(String(r.discord_user_id || "—"))}</td>` +
+          `<td style="padding:6px;font-size:12px">${escapeHtml(String(r.ip || ""))}</td>` +
+          `<td style="padding:6px;font-size:11px">${escapeHtml(String(r.path || ""))}</td>` +
+          `<td style="padding:6px;font-size:11px">${escapeHtml(String(r.note || ""))}</td></tr>`
+      )
+      .join("");
+    res.type("html").send(`<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Access logs</title>
+<style>
+body{font-family:system-ui,sans-serif;background:#0c0d10;color:#e8eaed;padding:20px;margin:0;}
+table{width:100%;border-collapse:collapse;background:#14161c;border:1px solid #252830;border-radius:12px;}
+th{text-align:left;padding:8px;background:#1a1d26;font-size:12px;}
+td{border-top:1px solid #252830;}
+a{color:#5865f2}
+.muted{color:#9aa0a6;font-size:13px;margin-bottom:12px;}
+</style></head><body>
+<h1>Archive / site access logs</h1>
+<p class="muted">IPs come from proxy headers (<code>X-Forwarded-For</code>) when available. Logs login attempts and archive views.</p>
+<p><a href="/admin">← OAuth admin</a></p>
+<table><thead><tr><th>Time</th><th>Discord user</th><th>IP</th><th>Path</th><th>Note</th></tr></thead><tbody>${rows || '<tr><td colspan="5">No rows yet — ensure <code>archive_access_logs</code> exists (see supabase_archive.sql).</td></tr>'}</tbody></table>
+</body></html>`);
+  } catch (e) {
+    res.status(500).send(String(e.message || e));
+  }
+});
+
+app.get("/admin/discord-tools", (req, res) => {
+  if (!adminAuthOk()) return res.status(503).send("Admin disabled");
+  if (!isAdminSession(req)) return res.redirect(302, "/admin");
+  res.type("html").send(`<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/><title>Discord user check</title>
+<style>
+body{font-family:system-ui;background:#0c0d10;color:#e8eaed;padding:20px;max-width:720px;margin:0 auto;}
+label{display:block;margin-bottom:6px;color:#b5bac1;font-size:14px;}
+input{width:100%;padding:10px;border-radius:8px;border:1px solid #252830;background:#14161c;color:#e8eaed;margin-bottom:14px;}
+button{padding:10px 18px;border-radius:10px;border:none;background:#5865f2;color:#fff;font-weight:600;cursor:pointer;}
+pre{background:#14161c;padding:14px;border-radius:10px;overflow:auto;font-size:12px;border:1px solid #252830;}
+a{color:#5865f2}
+</style></head><body>
+<h1>Discord user check</h1>
+<p style="color:#9aa0a6;font-size:14px;">Uses the bot token to resolve a user and guild membership (join eligibility is inferred from account state / flags).</p>
+<p><a href="/admin">← Back</a></p>
+<form method="post" action="/admin/discord-tools">
+<label for="uid">Discord user ID (snowflake)</label>
+<input id="uid" name="user_id" placeholder="e.g. 123456789012345678" required />
+<button type="submit">Lookup</button>
+</form>
+</body></html>`);
+});
+
+app.post("/admin/discord-tools", async (req, res) => {
+  if (!adminAuthOk() || !isAdminSession(req)) return res.status(403).send("Forbidden");
+  const uid = String(req.body.user_id || "").trim();
+  if (!/^\d{10,22}$/.test(uid)) {
+    return res.status(400).send("Invalid snowflake");
+  }
+  const gid = DISCORD_GUILD_ID ? String(DISCORD_GUILD_ID).trim() : "";
+  try {
+    const userR = await fetch(`${DISCORD_API}/users/${uid}`, {
+      headers: { Authorization: `Bot ${BOT_TOKEN}` },
+    });
+    const userText = await userR.text();
+    let userJson = null;
+    try {
+      userJson = JSON.parse(userText);
+    } catch {
+      userJson = null;
+    }
+
+    let memberBlock = "<p><em>Set DISCORD_GUILD_ID for membership check.</em></p>";
+    if (gid) {
+      const memR = await fetch(`${DISCORD_API}/guilds/${gid}/members/${uid}`, {
+        headers: { Authorization: `Bot ${BOT_TOKEN}` },
+      });
+      const mt = await memR.text();
+      memberBlock =
+        `<h2>Guild member (${escapeHtml(gid)})</h2>` +
+        `<pre>${escapeHtml(mt.slice(0, 4000))}</pre>` +
+        `<p>HTTP status: ${memR.status}</p>`;
+    }
+
+    const flags = userJson?.public_flags ?? userJson?.flags ?? "—";
+    const verified = userJson?.verified !== undefined ? String(userJson.verified) : "—";
+
+    res.type("html").send(`<!DOCTYPE html><html><head><meta charset="utf-8"/><title>Lookup</title>
+<style>body{font-family:system-ui;background:#0c0d10;color:#e8eaed;padding:20px;max-width:800px;margin:0 auto;} pre{background:#14161c;padding:14px;border-radius:10px;overflow:auto;font-size:12px;} a{color:#5865f2}</style></head><body>
+<h1>User ${escapeHtml(uid)}</h1>
+<p><a href="/admin/discord-tools">← Another lookup</a></p>
+<h2>Global user (bot REST)</h2>
+<pre>${escapeHtml(userText.slice(0, 6000))}</pre>
+<p>Public flags / account metadata: flags=<strong>${escapeHtml(String(flags))}</strong>, verified=<strong>${escapeHtml(verified)}</strong></p>
+${memberBlock}
+<p style="color:#9aa0a6;font-size:12px;">Banned users may still resolve via API; joining servers depends on invite, bans, verification level, etc.</p>
+</body></html>`);
+  } catch (e) {
+    res.status(500).send(String(e.message || e));
+  }
 });
 
 app.post("/admin/restore", async (req, res) => {
@@ -815,6 +948,24 @@ async function postVerificationEmbed() {
     console.error("[VERIFY] Failed to post verification embed:", err);
   }
 }
+
+attachArchiveSystem({
+  app,
+  bot,
+  supabase,
+  SITE_BASE,
+  ARCHIVE_GUILD_ID: String(DISCORD_GUILD_ID || "").trim(),
+  ARCHIVE_CHANNEL_IDS,
+  CLIENT_ID,
+  CLIENT_SECRET,
+  BOT_TOKEN,
+  SITE_AUTH_REDIRECT_URI:
+    process.env.SITE_AUTH_REDIRECT_URI?.trim() || `${SITE_BASE}/auth/callback`,
+  NUKE_INTERVAL_MS:
+    Math.max(60000, parseInt(process.env.NUKE_INTERVAL_MS || `${24 * 60 * 60 * 1000}`, 10) || 86400000),
+  CHANNEL_LABELS,
+  FIRST_NUKE_DELAY_MS: process.env.ARCHIVE_FIRST_NUKE_DELAY_MS,
+});
 
 bot.once("ready", () => {
   console.log(`Bot online as ${bot.user.tag}`);
