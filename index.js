@@ -964,7 +964,6 @@ attachArchiveSystem({
   NUKE_INTERVAL_MS:
     Math.max(60000, parseInt(process.env.NUKE_INTERVAL_MS || `${24 * 60 * 60 * 1000}`, 10) || 86400000),
   CHANNEL_LABELS,
-  FIRST_NUKE_DELAY_MS: process.env.ARCHIVE_FIRST_NUKE_DELAY_MS,
 });
 
 bot.once("ready", () => {

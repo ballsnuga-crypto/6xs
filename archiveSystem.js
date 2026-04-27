@@ -44,27 +44,68 @@ async function insertArchiveMessage(supabase, message) {
   const attachments = message.attachments?.size
     ? [...message.attachments.values()].map((a) => ({
         url: a.url,
-        name: a.name,
-        contentType: a.contentType,
+        proxyUrl: a.proxyURL ?? a.proxyUrl,
+        name: a.name || null,
+        contentType: a.contentType || null,
+        size: a.size ?? null,
+        width: a.width ?? null,
+        height: a.height ?? null,
+        duration: a.duration ?? null,
+        ephemeral: Boolean(a.ephemeral),
       }))
     : [];
   const embeds = message.embeds?.size
     ? [...message.embeds.values()].map((e) => e.toJSON())
     : [];
+  const stickers =
+    message.stickers?.size > 0
+      ? [...message.stickers.values()].map((s) => ({
+          id: String(s.id),
+          name: s.name,
+          url: s.url,
+        }))
+      : [];
+  const author = message.author;
   const row = {
     channel_id: String(message.channelId),
     message_id: String(message.id),
     guild_id: String(message.guildId),
-    author_id: String(message.author?.id || "0"),
-    author_tag: message.author?.tag || message.author?.username || "unknown",
+    author_id: String(author?.id || "0"),
+    author_tag: author?.tag || author?.username || "unknown",
+    author_username: author?.username || null,
+    author_avatar_hash: author?.avatar || null,
     content: message.content || "",
     attachments,
     embeds,
+    stickers,
     created_at_discord: message.createdAt?.toISOString() || new Date().toISOString(),
   };
-  const { error } = await supabase.from("archive_messages").upsert(row, {
+  let { error } = await supabase.from("archive_messages").upsert(row, {
     onConflict: "channel_id,message_id",
   });
+  if (error && String(error.message || "").includes("stickers")) {
+    const rowNoStickers = { ...row };
+    delete rowNoStickers.stickers;
+    ({ error } = await supabase.from("archive_messages").upsert(rowNoStickers, {
+      onConflict: "channel_id,message_id",
+    }));
+  }
+  if (error && String(error.message || "").includes("author_avatar_hash")) {
+    const rowMinimal = {
+      channel_id: row.channel_id,
+      message_id: row.message_id,
+      guild_id: row.guild_id,
+      author_id: row.author_id,
+      author_tag: row.author_tag,
+      content: row.content,
+      attachments: row.attachments,
+      embeds: row.embeds,
+      created_at_discord: row.created_at_discord,
+    };
+    ({ error } = await supabase.from("archive_messages").upsert(rowMinimal, {
+      onConflict: "channel_id,message_id",
+    }));
+  }
   if (error) console.warn("[archive] log message failed:", error.message);
 }
 
@@ -179,13 +220,7 @@ function attachArchiveSystem(deps) {
     SITE_AUTH_REDIRECT_URI,
     NUKE_INTERVAL_MS,
     CHANNEL_LABELS,
-    FIRST_NUKE_DELAY_MS,
   } = deps;
-
-  const firstDelayMs =
-    FIRST_NUKE_DELAY_MS != null && FIRST_NUKE_DELAY_MS !== ""
-      ? Math.max(0, Number(FIRST_NUKE_DELAY_MS))
-      : 60 * 1000;
 
   const authRedirect = SITE_AUTH_REDIRECT_URI;
 
@@ -286,35 +321,105 @@ function attachArchiveSystem(deps) {
     await insertArchiveMessage(supabase, message);
   });
 
-  const interval = NUKE_INTERVAL_MS || 24 * 60 * 60 * 1000;
+  const intervalMs = Math.max(60 * 60 * 1000, NUKE_INTERVAL_MS || 24 * 60 * 60 * 1000);
+  const MIN_SCHEDULE_MS = 60 * 1000;
 
-  function scheduleNuke() {
+  /**
+   * Reads/writes archive_nuke_schedule so restarts never purge immediately:
+   * new channel → first fire in `intervalMs`; overdue → push next fire forward without purging on boot.
+   */
+  async function prepareDelayMs(channelId) {
+    const { data, error } = await supabase
+      .from("archive_nuke_schedule")
+      .select("next_nuke_at")
+      .eq("channel_id", channelId)
+      .maybeSingle();
+
+    if (error) {
+      console.warn("[archive] schedule read failed (run supabase_archive.sql):", error.message);
+      return intervalMs;
+    }
+
+    const now = Date.now();
+
+    if (!data?.next_nuke_at) {
+      const next = new Date(now + intervalMs);
+      await supabase.from("archive_nuke_schedule").upsert(
+        { channel_id: channelId, next_nuke_at: next.toISOString() },
+        { onConflict: "channel_id" }
+      );
+      console.log(
+        `[archive] ${channelId}: first scheduled nuke in ${intervalMs / 3600000}h (nothing runs on restart until then)`
+      );
+      return intervalMs;
+    }
+
+    const nextTs = new Date(data.next_nuke_at).getTime();
+    let delay = nextTs - now;
+
+    if (delay < MIN_SCHEDULE_MS) {
+      const pushed = new Date(now + intervalMs);
+      await supabase.from("archive_nuke_schedule").upsert(
+        { channel_id: channelId, next_nuke_at: pushed.toISOString() },
+        { onConflict: "channel_id" }
+      );
+      console.log(
+        `[archive] ${channelId}: restart/overdue — skipped purge on boot; next wipe in ${intervalMs / 3600000}h`
+      );
+      delay = intervalMs;
+    } else {
+      console.log(
+        `[archive] ${channelId}: next wipe in ${Math.round(delay / 60000)} min`
+      );
+    }
+
+    return delay;
+  }
+
+  function startChannelScheduler(channelId) {
+    async function loop() {
+      let delayMs;
+      try {
+        delayMs = await prepareDelayMs(channelId);
+      } catch (e) {
+        console.error("[archive] prepareDelayMs", e);
+        delayMs = intervalMs;
+      }
+
+      setTimeout(async () => {
+        try {
+          await postNukeEmbedAndOptionallyPurge(bot, channelId, SITE_BASE, true);
+          const next = new Date(Date.now() + intervalMs);
+          await supabase.from("archive_nuke_schedule").upsert(
+            { channel_id: channelId, next_nuke_at: next.toISOString() },
+            { onConflict: "channel_id" }
+          );
+          console.log(`[archive] nuke completed ${channelId}; next at ${next.toISOString()}`);
+        } catch (e) {
+          console.error(`[archive] nuke failed ${channelId}`, e);
+        }
+        loop();
+      }, delayMs);
+    }
+
+    loop();
+  }
+
+  function scheduleNuksFromDb() {
     if (!ARCHIVE_GUILD_ID || ARCHIVE_CHANNEL_IDS.length === 0) {
-      console.warn("[archive] NUKE skipped: set DISCORD_GUILD_ID and ARCHIVE_CHANNEL_IDS");
+      console.warn("[archive] scheduling skipped: set DISCORD_GUILD_ID and ARCHIVE_CHANNEL_IDS");
       return;
     }
-    const run = async () => {
-      for (const cid of ARCHIVE_CHANNEL_IDS) {
-        try {
-          await postNukeEmbedAndOptionallyPurge(bot, cid, SITE_BASE, true);
-          console.log(`[archive] nuke cycle done for channel ${cid}`);
-        } catch (e) {
-          console.error(`[archive] nuke failed ${cid}`, e);
-        }
-      }
-    };
-
+    for (const cid of ARCHIVE_CHANNEL_IDS) {
+      startChannelScheduler(cid);
+    }
     console.log(
-      `[archive] ${ARCHIVE_CHANNEL_IDS.length} channel(s): first nuke in ${firstDelayMs / 1000}s, then every ${interval / 3600000}h`
+      `[archive] ${ARCHIVE_CHANNEL_IDS.length} channel(s); wipe interval ${intervalMs / 3600000}h (persisted in archive_nuke_schedule)`
     );
-    setTimeout(() => {
-      run();
-      setInterval(run, interval);
-    }, firstDelayMs);
   }
 
   bot.once("ready", () => {
-    scheduleNuke();
+    scheduleNuksFromDb();
   });
 
   return { buildSiteLoginUrl, logAccess };
@@ -389,8 +494,14 @@ function archiveShellHtml(siteBase, user, channelIds, labels) {
     .tabs button.active { border-color:var(--green); color:var(--green); }
     #feed { padding:20px; max-width:900px; margin:0 auto; }
     .msg { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:12px 14px; margin-bottom:10px; }
-    .meta { font-size:12px; color:var(--muted); margin-bottom:6px; }
-    .content { white-space:pre-wrap; word-break:break-word; font-size:14px; }
+    .msg-head { display:flex; align-items:center; gap:10px; margin-bottom:8px; }
+    .msg-head img.av { width:40px; height:40px; border-radius:50%; object-fit:cover; background:#1e2128; flex-shrink:0; }
+    .meta { font-size:12px; color:var(--muted); }
+    .meta strong { color:var(--text); font-size:14px; }
+    .content { white-space:pre-wrap; word-break:break-word; font-size:14px; margin-top:4px; }
+    .att { margin-top:10px; }
+    .att img, .att video { max-width:100%; border-radius:8px; vertical-align:middle; }
+    .embeds-preview { margin-top:8px; font-size:12px; color:var(--muted); border-left:3px solid #5865f2; padding-left:10px; }
     .loading { color:var(--muted); padding:20px; }
   </style>
 </head>
@@ -415,6 +526,61 @@ function archiveShellHtml(siteBase, user, channelIds, labels) {
       b.onclick = () => { active = id; [...tabs.querySelectorAll("button")].forEach(x => x.classList.toggle("active", x.dataset.id === active)); load(); };
       tabs.appendChild(b);
     });
+    function avatarUrl(row) {
+      const id = String(row.author_id || "");
+      const h = row.author_avatar_hash;
+      if (h) return "https://cdn.discordapp.com/avatars/" + id + "/" + h + ".png?size=64";
+      try {
+        var bi = BigInt(id);
+        var idx = Number((bi >> 22n) % 6n);
+        return "https://cdn.discordapp.com/embed/avatars/" + idx + ".png";
+      } catch (e) {
+        return "https://cdn.discordapp.com/embed/avatars/0.png";
+      }
+    }
+    function renderAttachments(att) {
+      if (!Array.isArray(att) || !att.length) return "";
+      var html = "";
+      for (var i = 0; i < att.length; i++) {
+        var a = att[i];
+        var url = a.proxyUrl || a.proxy_url || a.url || "";
+        var ct = String(a.contentType || a.content_type || "").toLowerCase();
+        var name = a.name || "attachment";
+        if (!url) continue;
+        if (ct.indexOf("image/") === 0) {
+          html += '<div class="att"><img src="' + escapeHtml(url) + '" alt="" loading="lazy" /></div>';
+        } else if (ct.indexOf("video/") === 0) {
+          html += '<div class="att"><video controls preload="metadata" src="' + escapeHtml(url) + '"></video></div>';
+        } else if (ct.indexOf("audio/") === 0 || name.indexOf("voice-message") !== -1) {
+          html += '<div class="att"><audio controls src="' + escapeHtml(url) + '"></audio></div>';
+        } else {
+          html += '<div class="att"><a href="' + escapeHtml(url) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(name) + "</a>";
+          if (a.size) html += ' <span style="color:#9aa0a6;font-size:12px">(' + Math.round(a.size/1024) + " KB)</span>";
+          html += "</div>";
+        }
+      }
+      return html;
+    }
+    function renderStickers(st) {
+      if (!Array.isArray(st) || !st.length) return "";
+      var h = "";
+      for (var i = 0; i < st.length; i++) {
+        if (st[i].url) h += '<div class="att"><img src="' + escapeHtml(st[i].url) + '" alt="' + escapeHtml(st[i].name||"") + '" width="160" loading="lazy" /></div>';
+      }
+      return h;
+    }
+    function renderEmbeds(embeds) {
+      if (!Array.isArray(embeds) || !embeds.length) return "";
+      var parts = [];
+      for (var i = 0; i < embeds.length; i++) {
+        var e = embeds[i];
+        var t = (e.title || "") + (e.description ? "\\n" + e.description : "");
+        if (e.url) t += "\\n" + e.url;
+        if (t.trim()) parts.push(t.trim());
+      }
+      if (!parts.length) return "";
+      return '<div class="embeds-preview">' + escapeHtml(parts.join("\\n---\\n").slice(0, 1500)) + "</div>";
+    }
     async function load() {
       feed.innerHTML = '<p class="loading">Loading…</p>';
       const r = await fetch("/api/archive/" + active + "?limit=80");
@@ -429,14 +595,22 @@ function archiveShellHtml(siteBase, user, channelIds, labels) {
         const div = document.createElement("div");
         div.className = "msg";
         const when = row.created_at_discord ? new Date(row.created_at_discord).toLocaleString() : "";
-        div.innerHTML = '<div class="meta">' + escapeHtml(row.author_tag || row.author_id) + " · " + escapeHtml(when) + '</div>' +
-          '<div class="content">' + escapeHtml(row.content || "") + '</div>';
+        const disp = row.author_tag || row.author_username || row.author_id;
+        div.innerHTML =
+          '<div class="msg-head">' +
+            '<img class="av" src="' + escapeHtml(avatarUrl(row)) + '" width="40" height="40" alt="" />' +
+            '<div><div class="meta"><strong>' + escapeHtml(String(disp)) + "</strong> · " + escapeHtml(when) + "</div></div>" +
+          "</div>" +
+          '<div class="content">' + escapeHtml(row.content || "") + "</div>" +
+          renderAttachments(row.attachments) +
+          renderStickers(row.stickers) +
+          renderEmbeds(row.embeds);
         feed.appendChild(div);
       }
     }
     function escapeHtml(s) {
       const d = document.createElement("div");
-      d.textContent = s;
+      d.textContent = s == null ? "" : s;
       return d.innerHTML;
     }
     load();
