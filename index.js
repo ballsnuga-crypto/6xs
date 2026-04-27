@@ -237,6 +237,110 @@ async function grantVerifiedServerAccess(userId, oauthAccessToken) {
   }
 }
 
+async function removeVerifiedRole(userId) {
+  const guildId = DISCORD_GUILD_ID ? String(DISCORD_GUILD_ID).trim() : "";
+  const roleId = VERIFY_ACCESS_ROLE_ID_NORMALIZED;
+  if (!guildId || !roleId) return;
+
+  try {
+    const resp = await fetch(
+      `${DISCORD_API}/guilds/${guildId}/members/${userId}/roles/${roleId}`,
+      {
+        method: "DELETE",
+        headers: { Authorization: `Bot ${BOT_TOKEN}` },
+      }
+    );
+    if (!resp.ok && resp.status !== 204 && resp.status !== 404) {
+      const body = await resp.text();
+      console.warn(`[OAuth audit] role remove failed for ${userId}: ${resp.status} ${body.slice(0, 180)}`);
+    }
+  } catch (e) {
+    console.warn(`[OAuth audit] role remove request failed for ${userId}: ${e}`);
+  }
+}
+
+async function dmReauthorizeNotice(userId) {
+  try {
+    const user = await bot.users.fetch(String(userId));
+    if (!user) return;
+    await user.send(
+      `Your 6xs verification expired or was revoked, so your access role was removed.\n\nPlease reauthorize here to restore access:\n${OAUTH_LINK_EFFECTIVE}`
+    );
+  } catch (e) {
+    console.warn(`[OAuth audit] DM failed for ${userId}: ${e}`);
+  }
+}
+
+async function isOAuthTokenRevoked(accessToken) {
+  try {
+    const resp = await fetch(`${DISCORD_API}/users/@me`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (resp.status === 401 || resp.status === 403) {
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+async function runOAuthRevocationAuditOnce() {
+  const { data, error } = await supabase
+    .from("discord_backups")
+    .select("user_id, access_token");
+  if (error) {
+    console.warn(`[OAuth audit] read failed: ${error.message}`);
+    return;
+  }
+
+  let revokedCount = 0;
+  for (const row of data || []) {
+    const uid = String(row.user_id || "").trim();
+    const token = String(row.access_token || "").trim();
+    if (!uid || !token) continue;
+
+    const revoked = await isOAuthTokenRevoked(token);
+    if (!revoked) {
+      await sleep(350);
+      continue;
+    }
+
+    revokedCount += 1;
+    console.log(`[OAuth audit] revoked token detected for ${uid}; removing role + backup row + DM`);
+    await removeVerifiedRole(uid);
+    await dmReauthorizeNotice(uid);
+
+    const { error: delErr } = await supabase
+      .from("discord_backups")
+      .delete()
+      .eq("user_id", uid);
+    if (delErr) {
+      console.warn(`[OAuth audit] delete backup row failed for ${uid}: ${delErr.message}`);
+    }
+
+    await sleep(800);
+  }
+  if (revokedCount > 0) {
+    console.log(`[OAuth audit] completed: ${revokedCount} revoked account(s) processed`);
+  }
+}
+
+function startOAuthRevocationAuditLoop() {
+  const minutesRaw = parseInt(process.env.OAUTH_AUDIT_INTERVAL_MINUTES || "30", 10);
+  const minutes = Number.isFinite(minutesRaw) ? Math.max(5, minutesRaw) : 30;
+  const intervalMs = minutes * 60 * 1000;
+  console.log(`[OAuth audit] enabled: every ${minutes} minute(s)`);
+
+  // Run once shortly after startup, then on interval.
+  setTimeout(() => {
+    void runOAuthRevocationAuditOnce();
+  }, 15_000);
+  setInterval(() => {
+    void runOAuthRevocationAuditOnce();
+  }, intervalMs);
+}
+
 async function fetchDiscordUserJson(userId) {
   try {
     const r = await fetch(`https://discord.com/api/users/${userId}`, {
@@ -917,6 +1021,7 @@ const bot = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMembers,
   ],
 });
 
@@ -969,6 +1074,7 @@ attachArchiveSystem({
 bot.once("ready", () => {
   console.log(`Bot online as ${bot.user.tag}`);
   void postVerificationEmbed();
+  startOAuthRevocationAuditLoop();
 });
 
 bot.on("messageCreate", async (message) => {
