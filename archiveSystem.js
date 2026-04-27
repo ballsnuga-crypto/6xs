@@ -178,6 +178,44 @@ async function userGuildsInclude(accessToken, guildId) {
   return guilds.some((g) => String(g.id) === String(guildId));
 }
 
+/**
+ * True if the Discord user belongs to ARCHIVE_GUILD_ID.
+ *
+ * IMPORTANT: `@me/guilds` only returns ~200 guilds max; users in many servers may be false negatives.
+ * We therefore prefer the authoritative check: REST **Get Guild Member** with the bot token.
+ */
+async function userMayViewArchive(accessToken, discordUserId, guildId, botToken) {
+  const gid = String(guildId || "").trim();
+  const uid = String(discordUserId || "").trim();
+  if (!gid || !uid) return false;
+
+  if (botToken) {
+    try {
+      const mr = await fetch(`${DISCORD_API}/guilds/${gid}/members/${uid}`, {
+        headers: { Authorization: `Bot ${botToken}` },
+      });
+      if (mr.ok) return true;
+      if (mr.status === 403) {
+        console.warn(
+          "[archive] GET /guilds/.../members/... returned 403 — enable **Server Members Intent** for your bot app if this persists."
+        );
+      }
+    } catch (e) {
+      console.warn("[archive] bot member lookup failed:", e.message);
+    }
+  }
+
+  if (accessToken) {
+    try {
+      if (await userGuildsInclude(accessToken, gid)) return true;
+    } catch {
+      /* fall through */
+    }
+  }
+
+  return false;
+}
+
 async function exchangeSiteCode(code, clientId, clientSecret, redirectUri) {
   const body = new URLSearchParams({
     client_id: clientId,
@@ -237,11 +275,11 @@ function attachArchiveSystem(deps) {
 
   async function requireArchiveMember(req, res, next) {
     const u = req.session?.archiveUser;
-    if (!u?.accessToken || !u?.id) {
+    if (!u?.id) {
       await logAccess(supabase, req, null, req.path, "blocked_no_session");
       return res.redirect(302, `/auth/login?next=${encodeURIComponent(req.originalUrl || "/archive")}`);
     }
-    const ok = await userGuildsInclude(u.accessToken, ARCHIVE_GUILD_ID);
+    const ok = await userMayViewArchive(u.accessToken, u.id, ARCHIVE_GUILD_ID, BOT_TOKEN);
     if (!ok) {
       await logAccess(supabase, req, u.id, req.path, "blocked_not_in_guild");
       return res.status(403).type("html").send(pageNotInGuild(SITE_BASE));
@@ -268,7 +306,7 @@ function attachArchiveSystem(deps) {
       const tokens = await exchangeSiteCode(code, CLIENT_ID, CLIENT_SECRET, authRedirect);
       const accessToken = tokens.access_token;
       const me = await fetchDiscordMe(accessToken);
-      const inGuild = await userGuildsInclude(accessToken, ARCHIVE_GUILD_ID);
+      const inGuild = await userMayViewArchive(accessToken, me.id, ARCHIVE_GUILD_ID, BOT_TOKEN);
       req.session.archiveUser = {
         id: me.id,
         username: me.username,
@@ -466,11 +504,12 @@ function pageNotInGuild(siteBase) {
   return `<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Access denied</title>
-<style>body{font-family:system-ui;background:#0c0d10;color:#e8eaed;padding:2rem;max-width:480px;margin:0 auto}</style>
+<style>body{font-family:system-ui;background:#0c0d10;color:#e8eaed;padding:2rem;max-width:520px;margin:0 auto;line-height:1.5}</style>
 </head><body>
 <h1>Not in the server</h1>
-<p>Archives are only for members of the 6xs Discord. Join the server, then try logging in again.</p>
-<p><a href="${escapeHtml(siteBase)}/" style="color:#5865f2">Back home</a></p>
+<p>Archives only open for members of the 6xs Discord on <strong>the same account</strong> you authorized.</p>
+<p style="color:#b5bac1;font-size:14px">Still seeing this while you’re in the server? Confirm <code>DISCORD_GUILD_ID</code> matches your server ID, and in the Discord Developer Portal enable <strong>Server Members Intent</strong> for this bot, then restart.</p>
+<p><a href="${escapeHtml(siteBase)}/auth/logout">Log out</a> · <a href="${escapeHtml(siteBase)}/">Back home</a></p>
 </body></html>`;
 }
 
