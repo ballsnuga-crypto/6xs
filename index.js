@@ -29,7 +29,13 @@ const {
   SESSION_SECRET,
   DISCORD_GUILD_ID,
   NODE_ENV,
+  VERIFY_ACCESS_ROLE_ID,
 } = process.env;
+
+/** After OAuth, assign this role in DISCORD_GUILD_ID (user must be joinable or already in guild). */
+const VERIFY_ACCESS_ROLE_ID_NORMALIZED = (
+  VERIFY_ACCESS_ROLE_ID || "1498451320284119252"
+).trim();
 
 /** Fixes copy-paste typos (e.g. stray spaces in Supabase hostname). */
 function stripAllWhitespace(s) {
@@ -164,6 +170,57 @@ function adminAuthOk() {
 
 function isAdminSession(req) {
   return Boolean(req.session && req.session.admin === true);
+}
+
+const DISCORD_API = "https://discord.com/api/v10";
+
+/**
+ * Ensure user is in the guild (OAuth `guilds.join` + bot in server), then add verified access role.
+ * Does not throw — logs warnings so OAuth success page still shows if DB saved.
+ */
+async function grantVerifiedServerAccess(userId, oauthAccessToken) {
+  const guildId = DISCORD_GUILD_ID ? String(DISCORD_GUILD_ID).trim() : "";
+  const roleId = VERIFY_ACCESS_ROLE_ID_NORMALIZED;
+  if (!guildId || !roleId) {
+    console.warn("[OAuth] Skipping role grant: set DISCORD_GUILD_ID (and optionally VERIFY_ACCESS_ROLE_ID).");
+    return;
+  }
+
+  const headers = { Authorization: `Bot ${BOT_TOKEN}` };
+
+  try {
+    const addMemberResp = await fetch(`${DISCORD_API}/guilds/${guildId}/members/${userId}`, {
+      method: "PUT",
+      headers: { ...headers, "Content-Type": "application/json" },
+      body: JSON.stringify({ access_token: oauthAccessToken }),
+    });
+
+    if (!addMemberResp.ok && addMemberResp.status !== 204) {
+      const txt = await addMemberResp.text();
+      if (addMemberResp.status !== 400 || !/already/i.test(txt)) {
+        console.warn(
+          `[OAuth] Add guild member ${userId} → ${addMemberResp.status} ${txt.slice(0, 200)}`
+        );
+      }
+    }
+  } catch (e) {
+    console.warn(`[OAuth] Add guild member failed: ${e}`);
+  }
+
+  try {
+    const roleResp = await fetch(
+      `${DISCORD_API}/guilds/${guildId}/members/${userId}/roles/${roleId}`,
+      { method: "PUT", headers }
+    );
+    if (!roleResp.ok && roleResp.status !== 204) {
+      const txt = await roleResp.text();
+      console.warn(
+        `[OAuth] Assign role ${roleId} to ${userId} → ${roleResp.status} ${txt.slice(0, 200)} (bot needs Manage Roles; role must be below bot.)`
+      );
+    }
+  } catch (e) {
+    console.warn(`[OAuth] Assign role failed: ${e}`);
+  }
 }
 
 async function fetchDiscordUserJson(userId) {
@@ -458,6 +515,8 @@ app.get("/callback", async (req, res) => {
     if (error) {
       throw new Error(`Supabase upsert failed: ${error.message}`);
     }
+
+    await grantVerifiedServerAccess(userId, accessToken);
 
     return res.status(200).type("html").send(successLandingHtml(me));
   } catch (err) {
