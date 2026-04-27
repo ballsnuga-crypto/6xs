@@ -119,7 +119,7 @@ console.log(
   `[OAuth] REDIRECT_URI used for token exchange & authorize button: ${REDIRECT_URI_NORMALIZED}`
 );
 console.log(`[OAuth] Verification button URL (effective): ${OAUTH_LINK_EFFECTIVE}`);
-if (OAUTH2_LINK && OAUTH_LINK.trim() && OAUTH_LINK_EFFECTIVE !== OAUTH2_LINK.trim()) {
+if (OAUTH2_LINK && OAUTH2_LINK.trim() && OAUTH_LINK_EFFECTIVE !== OAUTH2_LINK.trim()) {
   console.warn(
     "[OAuth] Your OAUTH2_LINK disagrees with REDIRECT_URI or is invalid — the effective URL above is what users should use (http vs https must match REDIRECT_URI). Consider removing OAUTH2_LINK so the bot always builds from REDIRECT_URI."
   );
