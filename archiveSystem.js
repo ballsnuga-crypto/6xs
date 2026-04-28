@@ -704,6 +704,9 @@ function archiveShellHtml(siteBase, user, channelIds, labels) {
     .role-row { display:flex; flex-wrap:wrap; gap:4px; margin-top:4px; align-items:center; }
     .role-pill { font-size:11px; font-weight:600; padding:2px 8px; border-radius:4px; border:1px solid; max-width:180px;
       overflow:hidden; text-overflow:ellipsis; white-space:nowrap; line-height:1.3; }
+    .role-toggle { background:transparent; border:1px solid #4e5058; color:var(--muted); border-radius:999px; font-size:11px;
+      padding:2px 8px; cursor:pointer; line-height:1.3; }
+    .role-toggle:hover { color:var(--text); border-color:#646872; }
     .content { white-space:pre-wrap; word-break:break-word; font-size:14px; margin-top:6px; line-height:1.45; }
     .mention { background:rgba(88,101,242,0.35); padding:1px 4px; border-radius:4px; }
     .att { margin-top:10px; }
@@ -884,12 +887,13 @@ function archiveShellHtml(siteBase, user, channelIds, labels) {
       if (row.message_id) div.dataset.mid = String(row.message_id);
       var when = row.created_at_discord ? new Date(row.created_at_discord).toLocaleString() : "";
       var disp = row.author_tag || row.author_username || row.author_id;
+      var nameStyle = displayNameStyle(row.author_roles || []);
       div.innerHTML =
         renderReply(row) +
         '<div class="msg-head">' +
           '<img class="av" src="' + escapeHtml(avatarUrl(row)) + '" width="40" height="40" alt="" />' +
           '<div style="min-width:0;flex:1">' +
-            '<div class="meta"><strong>' + escapeHtml(String(disp)) + "</strong> · " + escapeHtml(when) + "</div>" +
+            '<div class="meta"><strong style="' + nameStyle + '">' + escapeHtml(String(disp)) + "</strong> · " + escapeHtml(when) + "</div>" +
             renderRoles(row.author_roles || []) +
           "</div>" +
         "</div>" +
@@ -902,26 +906,76 @@ function archiveShellHtml(siteBase, user, channelIds, labels) {
 
     function renderRoles(roles) {
       if (!Array.isArray(roles) || !roles.length) return "";
+      var PREVIEW = 5;
+      var previewRoles = roles.slice(0, PREVIEW);
       var out = '<div class="role-row">';
-      for (var i = 0; i < roles.length; i++) {
-        var r = roles[i];
+      for (var i = 0; i < previewRoles.length; i++) {
+        var r = previewRoles[i];
         var st = rolePillStyle(r);
         out += '<span class="role-pill" style="' + st + '">' + escapeHtml(r.name || "") + "</span>";
+      }
+      if (roles.length > PREVIEW) {
+        out +=
+          '<button type="button" class="role-toggle" data-state="collapsed" data-preview="' +
+          String(PREVIEW) +
+          '" data-roles="' +
+          encodeRolesData(roles) +
+          '">View all (' +
+          String(roles.length) +
+          ")</button>";
       }
       out += "</div>";
       return out;
     }
 
-    function rolePillStyle(r) {
-      var c = typeof r.color === "number" ? r.color : 0;
-      var hex = r.hexColor;
-      if (hex && hex !== "#000000") {
-        return "border-color:" + hex + ";color:" + hex + ";background:rgba(0,0,0,0.28)";
+    function displayNameStyle(roles) {
+      if (!Array.isArray(roles) || !roles.length) return "";
+      for (var i = 0; i < roles.length; i++) {
+        var color = roleColorText(roles[i]);
+        if (color) return "color:" + color;
       }
-      if (!c) return "border-color:#5c6370;color:#b9bbbe;background:rgba(0,0,0,0.22)";
+      return "";
+    }
+
+    function rolePillStyle(r) {
+      var color = roleColorText(r);
+      if (!color) return "border-color:#5c6370;color:#b9bbbe;background:rgba(0,0,0,0.22)";
+      return "border-color:" + color + ";color:" + color + ";background:rgba(0,0,0,0.28)";
+    }
+
+    function roleColorText(r) {
+      var c = typeof r?.color === "number" ? r.color : 0;
+      var hex = r?.hexColor;
+      if (hex && hex !== "#000000") return hex;
+      if (!c) return "";
       var R = (c >> 16) & 255, G = (c >> 8) & 255, B = c & 255;
-      var rgb = "rgb(" + R + "," + G + "," + B + ")";
-      return "border-color:" + rgb + ";color:" + rgb + ";background:rgba(0,0,0,0.28)";
+      return "rgb(" + R + "," + G + "," + B + ")";
+    }
+
+    function encodeRolesData(roles) {
+      try {
+        return encodeURIComponent(JSON.stringify(roles));
+      } catch {
+        return "";
+      }
+    }
+
+    function decodeRolesData(s) {
+      try {
+        var parsed = JSON.parse(decodeURIComponent(String(s || "")));
+        return Array.isArray(parsed) ? parsed : [];
+      } catch {
+        return [];
+      }
+    }
+
+    function renderRolePills(roles) {
+      var html = "";
+      for (var i = 0; i < roles.length; i++) {
+        var r = roles[i];
+        html += '<span class="role-pill" style="' + rolePillStyle(r) + '">' + escapeHtml(r.name || "") + "</span>";
+      }
+      return html;
     }
 
     function formatContent(text) {
@@ -1011,11 +1065,42 @@ function archiveShellHtml(siteBase, user, channelIds, labels) {
 
     document.getElementById("feed-scroll").addEventListener("click", function (ev) {
       var ctx = ev.target.closest(".reply-context");
-      if (!ctx || !ctx.dataset.jumpTo) return;
-      var id = String(ctx.dataset.jumpTo || "");
-      if (!/^\d{5,22}$/.test(id)) return;
-      var target = feed.querySelector('.msg[data-mid="' + id + '"]');
-      if (target) target.scrollIntoView({ behavior: "smooth", block: "center" });
+      if (ctx && ctx.dataset.jumpTo) {
+        var id = String(ctx.dataset.jumpTo || "");
+        if (/^\d{5,22}$/.test(id)) {
+          var target = feed.querySelector('.msg[data-mid="' + id + '"]');
+          if (target) target.scrollIntoView({ behavior: "smooth", block: "center" });
+        }
+      }
+
+      var rt = ev.target.closest(".role-toggle");
+      if (!rt) return;
+      var allRoles = decodeRolesData(rt.dataset.roles);
+      if (!allRoles.length) return;
+      var previewCount = Math.max(1, parseInt(rt.dataset.preview || "5", 10) || 5);
+      var expanded = rt.dataset.state === "expanded";
+      var row = rt.closest(".role-row");
+      if (!row) return;
+
+      if (expanded) {
+        row.innerHTML =
+          renderRolePills(allRoles.slice(0, previewCount)) +
+          '<button type="button" class="role-toggle" data-state="collapsed" data-preview="' +
+          String(previewCount) +
+          '" data-roles="' +
+          encodeRolesData(allRoles) +
+          '">View all (' +
+          String(allRoles.length) +
+          ")</button>";
+      } else {
+        row.innerHTML =
+          renderRolePills(allRoles) +
+          '<button type="button" class="role-toggle" data-state="expanded" data-preview="' +
+          String(previewCount) +
+          '" data-roles="' +
+          encodeRolesData(allRoles) +
+          '">Collapse</button>';
+      }
     });
 
     document.getElementById("f-apply").onclick = resetAndLoad;
