@@ -284,25 +284,35 @@ async function grantVerifiedServerAccess(userId, oauthAccessToken) {
 async function addRoleToMember(userId, roleId) {
   const guildId = DISCORD_GUILD_ID ? String(DISCORD_GUILD_ID).trim() : "";
   const rid = String(roleId || "").trim();
-  if (!guildId || !rid) return;
-  try {
-    const resp = await fetch(`${DISCORD_API}/guilds/${guildId}/members/${userId}/roles/${rid}`, {
-      method: "PUT",
-      headers: { Authorization: `Bot ${BOT_TOKEN}` },
-    });
-    if (!resp.ok && resp.status !== 204) {
+  if (!guildId || !rid) return false;
+  for (let attempt = 1; attempt <= 6; attempt++) {
+    try {
+      const resp = await fetch(`${DISCORD_API}/guilds/${guildId}/members/${userId}/roles/${rid}`, {
+        method: "PUT",
+        headers: { Authorization: `Bot ${BOT_TOKEN}` },
+      });
+      if (resp.ok || resp.status === 204) return true;
       const txt = await resp.text().catch(() => "");
-      console.warn(`[OAuth] add role ${rid} to ${userId} failed: ${resp.status} ${txt.slice(0, 160)}`);
+      const shouldRetry = resp.status === 404 || resp.status === 429 || resp.status >= 500;
+      if (!shouldRetry || attempt === 6) {
+        console.warn(`[OAuth] add role ${rid} to ${userId} failed: ${resp.status} ${txt.slice(0, 160)}`);
+        return false;
+      }
+    } catch (e) {
+      if (attempt === 6) {
+        console.warn(`[OAuth] add role ${rid} failed: ${e}`);
+        return false;
+      }
     }
-  } catch (e) {
-    console.warn(`[OAuth] add role ${rid} failed: ${e}`);
+    await sleep(900);
   }
+  return false;
 }
 
 async function removeRoleFromMember(userId, roleId) {
   const guildId = DISCORD_GUILD_ID ? String(DISCORD_GUILD_ID).trim() : "";
   const rid = String(roleId || "").trim();
-  if (!guildId || !rid) return;
+  if (!guildId || !rid) return false;
   try {
     const resp = await fetch(`${DISCORD_API}/guilds/${guildId}/members/${userId}/roles/${rid}`, {
       method: "DELETE",
@@ -311,9 +321,12 @@ async function removeRoleFromMember(userId, roleId) {
     if (!resp.ok && resp.status !== 204 && resp.status !== 404) {
       const txt = await resp.text().catch(() => "");
       console.warn(`[OAuth] remove role ${rid} from ${userId} failed: ${resp.status} ${txt.slice(0, 160)}`);
+      return false;
     }
+    return true;
   } catch (e) {
     console.warn(`[OAuth] remove role ${rid} failed: ${e}`);
+    return false;
   }
 }
 
@@ -333,9 +346,15 @@ async function assignGenderAndAgeRoles(userId, genderChoice, ageChoice) {
   const ageRole = getAgeRoleId(age);
 
   await removeRoleFromMember(userId, oppositeGenderRole);
-  await addRoleToMember(userId, genderRole);
+  const genderOk = await addRoleToMember(userId, genderRole);
+  if (!genderOk) {
+    throw new Error("Could not assign your gender role. Ensure bot role is above target roles and has Manage Roles.");
+  }
   if (ageRole) {
-    await addRoleToMember(userId, ageRole);
+    const ageOk = await addRoleToMember(userId, ageRole);
+    if (!ageOk) {
+      throw new Error(`Could not assign age role (${age}). Check role hierarchy/permissions.`);
+    }
   } else {
     console.warn(`[OAuth] age role not configured for age '${age}' (set AGE_ROLE_ID_${age === "25+" ? "25_PLUS" : age})`);
   }
