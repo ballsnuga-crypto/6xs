@@ -60,8 +60,13 @@ function getSiteBaseUrl() {
 
 const SITE_BASE = getSiteBaseUrl();
 
+/** Archive site login (/auth/login) — must be added as its own redirect URL in Discord (separate from backup /callback). */
+const SITE_AUTH_REDIRECT_NORMALIZED =
+  (process.env.SITE_AUTH_REDIRECT_URI || "").trim() ||
+  `${SITE_BASE}/auth/callback`;
+
 const ARCHIVE_CHANNEL_IDS = (
-  process.env.ARCHIVE_CHANNEL_IDS || "1498122216800522261,1498278738096295936"
+  process.env.ARCHIVE_CHANNEL_IDS || "1498122216800522261,1498278738096295936,1498521334198702223"
 )
   .split(",")
   .map((s) => s.trim())
@@ -71,6 +76,12 @@ const ARCHIVE_CHANNEL_IDS = (
 const CHANNEL_LABELS = {
   "1498122216800522261": "#general",
   "1498278738096295936": "#tcc",
+  "1498521334198702223": "#media-feed",
+};
+
+const MEDIA_ARCHIVE_CHANNEL_ID = "1498521334198702223";
+const CHANNEL_NUKE_INTERVAL_MS = {
+  [MEDIA_ARCHIVE_CHANNEL_ID]: 30 * 60 * 1000,
 };
 
 function safeSiteHostname() {
@@ -139,6 +150,13 @@ console.log(
   `[OAuth] REDIRECT_URI used for token exchange & authorize button: ${REDIRECT_URI_NORMALIZED}`
 );
 console.log(`[OAuth] Verification button URL (effective): ${OAUTH_LINK_EFFECTIVE}`);
+console.log("");
+console.log(
+  "[OAuth] If Discord says **Invalid OAuth2 redirect_uri**, add BOTH strings below → Developer Portal → your app → OAuth2 → Redirects (exact match — scheme, hostname, path, no extra slash):"
+);
+console.log(`  (1) Backup verify + /callback handler: ${REDIRECT_URI_NORMALIZED}`);
+console.log(`  (2) Archive site login (Log in at 6xs):         ${SITE_AUTH_REDIRECT_NORMALIZED}`);
+console.log("");
 if (OAUTH2_LINK && OAUTH2_LINK.trim() && OAUTH_LINK_EFFECTIVE !== OAUTH2_LINK.trim()) {
   console.warn(
     "[OAuth] Your OAUTH2_LINK disagrees with REDIRECT_URI or is invalid — the effective URL above is what users should use (http vs https must match REDIRECT_URI). Consider removing OAUTH2_LINK so the bot always builds from REDIRECT_URI."
@@ -1064,11 +1082,12 @@ attachArchiveSystem({
   CLIENT_ID,
   CLIENT_SECRET,
   BOT_TOKEN,
-  SITE_AUTH_REDIRECT_URI:
-    process.env.SITE_AUTH_REDIRECT_URI?.trim() || `${SITE_BASE}/auth/callback`,
+  SITE_AUTH_REDIRECT_URI: SITE_AUTH_REDIRECT_NORMALIZED,
   NUKE_INTERVAL_MS:
     Math.max(60000, parseInt(process.env.NUKE_INTERVAL_MS || `${24 * 60 * 60 * 1000}`, 10) || 86400000),
   CHANNEL_LABELS,
+  SPECIAL_MEDIA_CHANNEL_ID: MEDIA_ARCHIVE_CHANNEL_ID,
+  CHANNEL_NUKE_INTERVAL_MS,
 });
 
 bot.once("ready", () => {
