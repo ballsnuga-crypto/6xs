@@ -86,6 +86,10 @@ if (!ARCHIVE_CHANNEL_IDS.includes(MEDIA_ARCHIVE_CHANNEL_ID)) {
 const CHANNEL_NUKE_INTERVAL_MS = {
   [MEDIA_ARCHIVE_CHANNEL_ID]: 30 * 60 * 1000,
 };
+const DEFAULT_NUKE_INTERVAL_MS = Math.max(
+  60000,
+  parseInt(process.env.NUKE_INTERVAL_MS || `${24 * 60 * 60 * 1000}`, 10) || 86400000
+);
 const MEDIA_BACKUP_ENABLED = String(process.env.ARCHIVE_MEDIA_BACKUP_ENABLED || "1").trim() !== "0";
 const MEDIA_BACKUP_BUCKET = String(process.env.ARCHIVE_MEDIA_BUCKET || "archive-media").trim() || "archive-media";
 const MEDIA_BACKUP_MAX_BYTES = Math.max(
@@ -1095,8 +1099,7 @@ attachArchiveSystem({
   CLIENT_SECRET,
   BOT_TOKEN,
   SITE_AUTH_REDIRECT_URI: SITE_AUTH_REDIRECT_NORMALIZED,
-  NUKE_INTERVAL_MS:
-    Math.max(60000, parseInt(process.env.NUKE_INTERVAL_MS || `${24 * 60 * 60 * 1000}`, 10) || 86400000),
+  NUKE_INTERVAL_MS: DEFAULT_NUKE_INTERVAL_MS,
   CHANNEL_LABELS,
   SPECIAL_MEDIA_CHANNEL_ID: MEDIA_ARCHIVE_CHANNEL_ID,
   CHANNEL_NUKE_INTERVAL_MS,
@@ -1108,6 +1111,58 @@ attachArchiveSystem({
   BUNNY_CDN_BASE,
 });
 
+function formatRemainingMs(ms) {
+  const sec = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  return `${h}h ${String(m).padStart(2, "0")}m ${String(s).padStart(2, "0")}s`;
+}
+
+function intervalMsForChannel(channelId) {
+  const raw = parseInt(CHANNEL_NUKE_INTERVAL_MS[String(channelId)] || "", 10);
+  if (Number.isFinite(raw) && raw > 0) return Math.max(60000, raw);
+  return DEFAULT_NUKE_INTERVAL_MS;
+}
+
+async function sendArchiveTimer(message, channelArg) {
+  const requested = String(channelArg || "").trim();
+  const wantedIds = requested
+    ? (/^\d{17,22}$/.test(requested) ? [requested] : [])
+    : [...ARCHIVE_CHANNEL_IDS];
+  if (requested && wantedIds.length === 0) {
+    await message.reply("Use `!timer` / `6timer` or `!timer <channel_id>`.");
+    return;
+  }
+  const rowsResp = await supabase
+    .from("archive_nuke_schedule")
+    .select("channel_id,next_nuke_at")
+    .in("channel_id", wantedIds);
+  if (rowsResp.error) {
+    await message.reply(`Timer lookup failed: ${rowsResp.error.message}`);
+    return;
+  }
+  const byId = new Map();
+  for (const r of rowsResp.data || []) byId.set(String(r.channel_id), r);
+
+  const now = Date.now();
+  const lines = ["**Archive nuke timers**"];
+  for (const cid of wantedIds) {
+    const label = CHANNEL_LABELS[cid] || `#${cid.slice(-6)}`;
+    const row = byId.get(cid);
+    if (row?.next_nuke_at) {
+      const ts = new Date(row.next_nuke_at).getTime();
+      if (Number.isFinite(ts) && ts > 0) {
+        lines.push(`- ${label} (<#${cid}>): ${formatRemainingMs(ts - now)} (at <t:${Math.floor(ts / 1000)}:F>)`);
+        continue;
+      }
+    }
+    const intervalMs = intervalMsForChannel(cid);
+    lines.push(`- ${label} (<#${cid}>): schedule not created yet (interval ${Math.round(intervalMs / 60000)} min)`);
+  }
+  await message.reply(lines.join("\n").slice(0, 1950));
+}
+
 bot.once("ready", () => {
   console.log(`Bot online as ${bot.user.tag}`);
   void postVerificationEmbed();
@@ -1116,7 +1171,16 @@ bot.once("ready", () => {
 
 bot.on("messageCreate", async (message) => {
   if (!message.guild || message.author.bot) return;
-  if (message.content.trim().toLowerCase() !== "!restore") return;
+  const raw = message.content.trim();
+  const lower = raw.toLowerCase();
+  const parts = raw.split(/\s+/);
+  const cmd = (parts[0] || "").toLowerCase();
+
+  if (cmd === "!timer" || cmd === "6timer") {
+    await sendArchiveTimer(message, parts[1] || "");
+    return;
+  }
+  if (lower !== "!restore") return;
 
   const member = message.member;
   if (!member || !member.permissions.has(PermissionsBitField.Flags.Administrator)) {
