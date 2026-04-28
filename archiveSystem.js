@@ -70,6 +70,34 @@ function joinBaseAndPath(base, path) {
   return `${cleanBase}/${parts.join("/")}`;
 }
 
+function guessBunnyCdnBaseFromEndpoint(endpoint) {
+  try {
+    const u = new URL(String(endpoint || ""));
+    const parts = u.pathname.split("/").filter(Boolean);
+    if (!parts.length) return "";
+    const zone = parts[0];
+    if (!zone) return "";
+    return `https://${zone}.b-cdn.net`;
+  } catch {
+    return "";
+  }
+}
+
+function normalizeBunnyCdnBase(input, fallbackEndpoint) {
+  const raw = String(input || "").trim();
+  if (!raw) return guessBunnyCdnBaseFromEndpoint(fallbackEndpoint);
+  try {
+    const u = new URL(raw);
+    if (/^storage\.bunnycdn\.com$/i.test(u.hostname)) {
+      const guessed = guessBunnyCdnBaseFromEndpoint(raw);
+      if (guessed) return guessed;
+    }
+    return raw.replace(/\/+$/, "");
+  } catch {
+    return guessBunnyCdnBaseFromEndpoint(fallbackEndpoint);
+  }
+}
+
 function rewriteSupabasePublicToCdn(url, cdnBase, bucket) {
   const u = String(url || "").trim();
   const base = String(cdnBase || "").trim().replace(/\/+$/, "");
@@ -129,7 +157,7 @@ async function mirrorAttachmentToBunny(attachment, ctx, cfg) {
       console.warn(`[archive] bunny upload failed ${putResp.status}: ${String(t).slice(0, 180)}`);
       return null;
     }
-    const readBase = cfg.bunnyCdnBase || cfg.bunnyEndpoint;
+    const readBase = cfg.bunnyCdnBase || guessBunnyCdnBaseFromEndpoint(cfg.bunnyEndpoint) || cfg.bunnyEndpoint;
     return joinBaseAndPath(readBase, path);
   } catch (e) {
     console.warn("[archive] bunny mirror fetch/upload error:", e.message);
@@ -562,9 +590,9 @@ function attachArchiveSystem(deps) {
         : "supabase",
     bunnyEndpoint: String(BUNNY_STORAGE_ENDPOINT || "").replace(/\/+$/, ""),
     bunnyAccessKey: String(BUNNY_STORAGE_ACCESS_KEY || "").trim(),
-    bunnyCdnBase: String(BUNNY_CDN_BASE || "").replace(/\/+$/, ""),
+    bunnyCdnBase: normalizeBunnyCdnBase(BUNNY_CDN_BASE, BUNNY_STORAGE_ENDPOINT),
   };
-  const mediaCdnBase = String(BUNNY_CDN_BASE || "").trim().replace(/\/+$/, "");
+  const mediaCdnBase = normalizeBunnyCdnBase(BUNNY_CDN_BASE, BUNNY_STORAGE_ENDPOINT);
 
   function buildSiteLoginUrl() {
     const params = new URLSearchParams({
@@ -990,7 +1018,7 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
       padding:10px 20px; background:transparent; border:none; color:var(--text); cursor:pointer; font-size:13px; }
     .filters-toggle .hint { color:var(--muted); font-size:12px; }
     .filters { display:none; padding:14px 20px;
-      display:flex; flex-wrap:wrap; gap:12px; align-items:flex-end; max-width:1100px; margin:0 auto; width:100%; box-sizing:border-box; }
+      flex-wrap:wrap; gap:12px; align-items:flex-end; max-width:1100px; margin:0 auto; width:100%; box-sizing:border-box; }
     .filters.show { display:flex; }
     .filters .field label { font-size:11px; color:var(--muted); display:block; margin-bottom:4px; }
     .filters input[type="text"], .filters input[type="search"], .filters input[type="datetime-local"] {
