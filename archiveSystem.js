@@ -1351,14 +1351,26 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
       var html = "";
       for (var i = 0; i < att.length; i++) {
         var a = att[i];
-        var url = a.mirroredUrl || a.mirrored_url || a.proxyUrl || a.proxy_url || a.url || "";
+        var urls = uniqueMediaUrls(a);
+        var url = urls[0] || "";
+        var alt = encodeAltUrls(urls.slice(1));
         var ct = String(a.contentType || a.content_type || "").toLowerCase();
         var name = a.name || "attachment";
         if (!url) continue;
         if (ct.indexOf("image/") === 0) {
-          html += '<div class="att"><img src="' + escapeHtml(url) + '" alt="" loading="lazy" /></div>';
+          html +=
+            '<div class="att"><img src="' +
+            escapeHtml(url) +
+            '" alt="" loading="lazy" data-alt-urls="' +
+            escapeHtml(alt) +
+            '" data-fallback-idx="0" onerror="archiveMediaFallback(this)" /></div>';
         } else if (ct.indexOf("video/") === 0) {
-          html += '<div class="att"><video controls preload="metadata" src="' + escapeHtml(url) + '"></video></div>';
+          html +=
+            '<div class="att"><video controls preload="metadata" src="' +
+            escapeHtml(url) +
+            '" data-alt-urls="' +
+            escapeHtml(alt) +
+            '" data-fallback-idx="0" onerror="archiveMediaFallback(this)"></video></div>';
         } else if (ct.indexOf("audio/") === 0 || name.indexOf("voice-message") !== -1) {
           html += '<div class="att"><audio controls src="' + escapeHtml(url) + '"></audio></div>';
         } else {
@@ -1369,6 +1381,46 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
       }
       return html;
     }
+
+    function uniqueMediaUrls(a) {
+      var cands = [a?.mirroredUrl, a?.mirrored_url, a?.proxyUrl, a?.proxy_url, a?.url];
+      var out = [];
+      for (var i = 0; i < cands.length; i++) {
+        var u = String(cands[i] || "").trim();
+        if (!u || out.indexOf(u) !== -1) continue;
+        out.push(u);
+      }
+      return out;
+    }
+
+    function encodeAltUrls(arr) {
+      try {
+        return encodeURIComponent(JSON.stringify(arr || []));
+      } catch {
+        return "";
+      }
+    }
+
+    function decodeAltUrls(s) {
+      try {
+        var parsed = JSON.parse(decodeURIComponent(String(s || "")));
+        return Array.isArray(parsed) ? parsed : [];
+      } catch {
+        return [];
+      }
+    }
+
+    function archiveMediaFallback(el) {
+      var list = decodeAltUrls(el.dataset.altUrls || "");
+      var idx = parseInt(el.dataset.fallbackIdx || "0", 10) || 0;
+      if (!list.length || idx >= list.length) return;
+      var next = String(list[idx] || "");
+      el.dataset.fallbackIdx = String(idx + 1);
+      if (!next) return;
+      el.src = next;
+      if (typeof el.load === "function") el.load();
+    }
+    window.archiveMediaFallback = archiveMediaFallback;
 
     function renderStickers(st) {
       if (!Array.isArray(st) || !st.length) return "";
@@ -1528,16 +1580,62 @@ function archivePostHtml(siteBase, user, channelId, messageId, channelTitle) {
       var html = "";
       for (var i = 0; i < att.length; i++) {
         var a = att[i] || {};
-        var url = a.mirroredUrl || a.mirrored_url || a.proxyUrl || a.proxy_url || a.url || "";
+        var urls = uniqueUrls(a);
+        var url = urls[0] || "";
+        var alt = encodeAlt(urls.slice(1));
         var ct = String(a.contentType || a.content_type || "").toLowerCase();
         var name = a.name || "attachment";
         if (!url) continue;
-        if (ct.indexOf("image/") === 0) html += '<div class="att"><img src="' + esc(url) + '" alt="" loading="lazy" /></div>';
-        else if (ct.indexOf("video/") === 0) html += '<div class="att"><video controls preload="metadata" src="' + esc(url) + '"></video></div>';
+        if (ct.indexOf("image/") === 0) {
+          html +=
+            '<div class="att"><img src="' +
+            esc(url) +
+            '" alt="" loading="lazy" data-alt-urls="' +
+            esc(alt) +
+            '" data-fallback-idx="0" onerror="postMediaFallback(this)" /></div>';
+        } else if (ct.indexOf("video/") === 0) {
+          html +=
+            '<div class="att"><video controls preload="metadata" src="' +
+            esc(url) +
+            '" data-alt-urls="' +
+            esc(alt) +
+            '" data-fallback-idx="0" onerror="postMediaFallback(this)"></video></div>';
+        }
         else html += '<div class="att"><a href="' + esc(url) + '" target="_blank" rel="noopener noreferrer">' + esc(name) + "</a></div>";
       }
       return html;
     }
+
+    function uniqueUrls(a) {
+      var cands = [a?.mirroredUrl, a?.mirrored_url, a?.proxyUrl, a?.proxy_url, a?.url];
+      var out = [];
+      for (var i = 0; i < cands.length; i++) {
+        var u = String(cands[i] || "").trim();
+        if (!u || out.indexOf(u) !== -1) continue;
+        out.push(u);
+      }
+      return out;
+    }
+    function encodeAlt(arr) {
+      try { return encodeURIComponent(JSON.stringify(arr || [])); } catch { return ""; }
+    }
+    function decodeAlt(s) {
+      try {
+        var parsed = JSON.parse(decodeURIComponent(String(s || "")));
+        return Array.isArray(parsed) ? parsed : [];
+      } catch { return []; }
+    }
+    function postMediaFallback(el) {
+      var list = decodeAlt(el.dataset.altUrls || "");
+      var idx = parseInt(el.dataset.fallbackIdx || "0", 10) || 0;
+      if (!list.length || idx >= list.length) return;
+      var next = String(list[idx] || "");
+      el.dataset.fallbackIdx = String(idx + 1);
+      if (!next) return;
+      el.src = next;
+      if (typeof el.load === "function") el.load();
+    }
+    window.postMediaFallback = postMediaFallback;
 
     fetch("/api/archive/" + encodeURIComponent(channelId) + "/" + encodeURIComponent(messageId))
       .then(function (r) { return r.ok ? r.json() : Promise.reject(); })
