@@ -548,6 +548,33 @@ function attachArchiveSystem(deps) {
     });
   });
 
+  app.get("/api/archive/:channelId/:messageId", requireArchiveMember, async (req, res) => {
+    const channelId = String(req.params.channelId || "");
+    const messageId = String(req.params.messageId || "");
+    if (!ARCHIVE_CHANNEL_IDS.includes(channelId)) return res.status(404).json({ error: "unknown channel" });
+    if (!/^\d{17,22}$/.test(messageId)) return res.status(400).json({ error: "invalid message id" });
+    const { data, error } = await supabase
+      .from("archive_messages")
+      .select("*")
+      .eq("channel_id", channelId)
+      .eq("message_id", messageId)
+      .maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    if (!data) return res.status(404).json({ error: "not found" });
+    res.json({ row: data });
+  });
+
+  app.get("/archive/post/:channelId/:messageId", requireArchiveMember, async (req, res) => {
+    const channelId = String(req.params.channelId || "");
+    const messageId = String(req.params.messageId || "");
+    if (!ARCHIVE_CHANNEL_IDS.includes(channelId)) return res.status(404).type("html").send("Unknown channel");
+    if (!/^\d{17,22}$/.test(messageId)) return res.status(400).type("html").send("Invalid message ID");
+    const u = req.session.archiveUser;
+    const labels = CHANNEL_LABELS || {};
+    const title = labels[channelId] || "#archive";
+    res.type("html").send(archivePostHtml(SITE_BASE, u, channelId, messageId, title));
+  });
+
   bot.on("messageCreate", async (message) => {
     if (!message.guild) return;
     if (!ARCHIVE_CHANNEL_IDS.includes(String(message.channelId))) return;
@@ -822,8 +849,8 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
   </div>
   <div class="tabs" id="tabs"></div>
   <div class="mode-row" id="mode-row">
-    <button type="button" id="mode-messages" class="active">Messages</button>
-    <button type="button" id="mode-media">Media only</button>
+    <button type="button" id="mode-messages" class="active">Chats</button>
+    <button type="button" id="mode-media">Media</button>
   </div>
   <div id="stats"></div>
   <div id="feed-scroll">
@@ -974,13 +1001,16 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
       var disp = row.author_tag || row.author_username || row.author_id;
       var body = renderAttachments(row.attachments);
       if (!body) body = '<div class="content">' + formatContent(row.content || "") + "</div>";
+      var sitePost =
+        "/archive/post/" + encodeURIComponent(String(row.channel_id || "")) + "/" + encodeURIComponent(String(row.message_id || ""));
       div.innerHTML =
         '<div class="meta"><strong>' + escapeHtml(String(disp)) + "</strong> · " + escapeHtml(when) + "</div>" +
         '<div class="att" style="margin-top:8px"><a href="https://discord.com/channels/' +
         escapeHtml(String(row.guild_id || "")) + "/" +
         escapeHtml(String(row.channel_id || "")) + "/" +
         escapeHtml(String(row.message_id || "")) +
-        '" target="_blank" rel="noopener noreferrer">Open original Discord message</a></div>' +
+        '" target="_blank" rel="noopener noreferrer">Open original Discord message</a> · ' +
+        '<a href="' + escapeHtml(sitePost) + '" target="_blank" rel="noopener noreferrer">Open archive post page</a></div>' +
         body;
       return div;
     }
@@ -1253,6 +1283,84 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
     syncModeButtons();
     resetAndLoad();
     setupObserver();
+  </script>
+</body>
+</html>`;
+}
+
+function archivePostHtml(siteBase, user, channelId, messageId, channelTitle) {
+  const name = escapeHtml(user.global_name || user.username || "member");
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${escapeHtml(channelTitle)} post — 6xs</title>
+  <style>
+    :root { --bg:#0c0d10; --panel:#14161c; --border:#252830; --text:#e8eaed; --muted:#9aa0a6; }
+    html, body { margin:0; height:100%; background:var(--bg); color:var(--text); font-family:system-ui,sans-serif; }
+    .wrap { max-width:980px; margin:0 auto; padding:20px; }
+    .top { display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:14px; flex-wrap:wrap; }
+    a { color:#8ea1ff; }
+    .card { border:1px solid var(--border); background:var(--panel); border-radius:12px; padding:14px; }
+    .meta { color:var(--muted); font-size:13px; margin-bottom:8px; }
+    .content { white-space:pre-wrap; word-break:break-word; line-height:1.45; }
+    .att { margin-top:10px; }
+    .att img, .att video { max-width:100%; border-radius:8px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <div>Signed in as <strong>${name}</strong></div>
+      <div><a href="/archive">Back to archives</a></div>
+    </div>
+    <div class="card" id="post"><div class="meta">Loading post…</div></div>
+  </div>
+  <script>
+    const channelId = ${JSON.stringify(String(channelId || ""))};
+    const messageId = ${JSON.stringify(String(messageId || ""))};
+
+    function esc(s) {
+      var d = document.createElement("div");
+      d.textContent = s == null ? "" : s;
+      return d.innerHTML;
+    }
+    function format(t) {
+      return esc(t || "").replace(/&lt;@!?([0-9]{5,22})&gt;/g, '<span style="background:rgba(88,101,242,.35);padding:1px 4px;border-radius:4px">&lt;@$1&gt;</span>');
+    }
+    function renderAtt(att) {
+      if (!Array.isArray(att) || !att.length) return "";
+      var html = "";
+      for (var i = 0; i < att.length; i++) {
+        var a = att[i] || {};
+        var url = a.proxyUrl || a.proxy_url || a.url || "";
+        var ct = String(a.contentType || a.content_type || "").toLowerCase();
+        var name = a.name || "attachment";
+        if (!url) continue;
+        if (ct.indexOf("image/") === 0) html += '<div class="att"><img src="' + esc(url) + '" alt="" loading="lazy" /></div>';
+        else if (ct.indexOf("video/") === 0) html += '<div class="att"><video controls preload="metadata" src="' + esc(url) + '"></video></div>';
+        else html += '<div class="att"><a href="' + esc(url) + '" target="_blank" rel="noopener noreferrer">' + esc(name) + "</a></div>";
+      }
+      return html;
+    }
+
+    fetch("/api/archive/" + encodeURIComponent(channelId) + "/" + encodeURIComponent(messageId))
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(); })
+      .then(function (j) {
+        var row = j.row || {};
+        var when = row.created_at_discord ? new Date(row.created_at_discord).toLocaleString() : "";
+        var who = row.author_tag || row.author_username || row.author_id || "unknown";
+        var post = document.getElementById("post");
+        post.innerHTML =
+          '<div class="meta"><strong>' + esc(String(who)) + "</strong> · " + esc(when) + "</div>" +
+          '<div><a href="https://discord.com/channels/' + esc(String(row.guild_id || "")) + "/" + esc(String(row.channel_id || "")) + "/" + esc(String(row.message_id || "")) + '" target="_blank" rel="noopener noreferrer">Open original Discord message</a></div>' +
+          '<div class="content" style="margin-top:10px">' + format(row.content || "") + "</div>" +
+          renderAtt(row.attachments);
+      })
+      .catch(function () {
+        document.getElementById("post").innerHTML = '<div class="meta">Post not found.</div>';
+      });
   </script>
 </body>
 </html>`;
