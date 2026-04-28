@@ -335,6 +335,7 @@ async function insertArchiveMessage(supabase, message, mediaCfg = null) {
     author_id: String(author?.id || "0"),
     author_tag: author?.tag || author?.username || "unknown",
     author_username: author?.username || null,
+    author_is_bot: Boolean(author?.bot),
     author_avatar_hash: author?.avatar || null,
     content: message.content || "",
     attachments,
@@ -365,6 +366,7 @@ async function insertArchiveMessage(supabase, message, mediaCfg = null) {
       guild_id: row.guild_id,
       author_id: row.author_id,
       author_tag: row.author_tag,
+      author_is_bot: row.author_is_bot,
       content: row.content,
       attachments: row.attachments,
       embeds: row.embeds,
@@ -677,6 +679,8 @@ function attachArchiveSystem(deps) {
     if (/^\d{17,22}$/.test(mentionUser)) {
       qb = qb.contains("mention_user_ids", [mentionUser]);
     }
+    const hideBots = String(req.query.hide_bots || "") === "1";
+    if (hideBots) qb = qb.eq("author_is_bot", false);
 
     const dateFrom = String(req.query.date_from || "").trim();
     const dateTo = String(req.query.date_to || "").trim();
@@ -706,6 +710,7 @@ function attachArchiveSystem(deps) {
 
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || "40", 10) || 40));
     const offset = Math.max(0, parseInt(req.query.offset || "0", 10) || 0);
+    const hideBots = String(req.query.hide_bots || "") === "1";
 
     const rows = [];
     let cursor = offset;
@@ -721,6 +726,7 @@ function attachArchiveSystem(deps) {
       const chunk = data || [];
       if (!chunk.length) break;
       for (const row of chunk) {
+        if (hideBots && row.author_is_bot) continue;
         if (rowHasMedia(row)) rows.push(row);
         if (rows.length >= limit) break;
       }
@@ -979,8 +985,13 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
       display:flex; flex-direction:column; min-height:100vh; max-height:100vh; overflow:hidden; }
     header { flex-shrink:0; padding:16px 20px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; }
     header a { color:#5865f2; }
-    .filters { flex-shrink:0; padding:14px 20px; border-bottom:1px solid var(--border); background:#14161c;
+    .filters-wrap { flex-shrink:0; border-bottom:1px solid var(--border); background:#14161c; }
+    .filters-toggle { width:100%; max-width:1100px; margin:0 auto; display:flex; justify-content:space-between; align-items:center;
+      padding:10px 20px; background:transparent; border:none; color:var(--text); cursor:pointer; font-size:13px; }
+    .filters-toggle .hint { color:var(--muted); font-size:12px; }
+    .filters { display:none; padding:14px 20px;
       display:flex; flex-wrap:wrap; gap:12px; align-items:flex-end; max-width:1100px; margin:0 auto; width:100%; box-sizing:border-box; }
+    .filters.show { display:flex; }
     .filters .field label { font-size:11px; color:var(--muted); display:block; margin-bottom:4px; }
     .filters input[type="text"], .filters input[type="search"], .filters input[type="datetime-local"] {
       background:#1e2128; border:1px solid var(--border); color:var(--text); padding:8px 10px; border-radius:8px; font-size:13px;
@@ -1029,15 +1040,21 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
     <span>Signed in as <strong>${name}</strong></span>
     <span><a href="/">Home</a> · <a href="/auth/logout">Log out</a></span>
   </header>
-  <div class="filters">
+  <div class="filters-wrap">
+    <button type="button" class="filters-toggle" id="filters-toggle">
+      <span>Search and filters</span><span class="hint" id="filters-toggle-label">Show</span>
+    </button>
+  <div class="filters" id="filters">
     <div class="field"><label for="f-q">Contains</label><input type="search" id="f-q" placeholder="Search message text…" /></div>
     <div class="field"><label for="f-author-id">From user ID</label><input type="text" id="f-author-id" placeholder="Snowflake" inputmode="numeric" /></div>
     <div class="field"><label for="f-author">Username contains</label><input type="text" id="f-author" placeholder="e.g. rain" /></div>
     <div class="field"><label for="f-from">After</label><input type="datetime-local" id="f-from" /></div>
     <div class="field"><label for="f-to">Before</label><input type="datetime-local" id="f-to" /></div>
     <div class="field"><label for="f-mentions">Mentions user ID</label><input type="text" id="f-mentions" placeholder="Who was @'d" /></div>
+    <div class="field"><label for="f-hide-bots">Bot messages</label><input type="checkbox" id="f-hide-bots" checked /> Hide bot messages</div>
     <button type="button" class="primary" id="f-apply">Apply filters</button>
     <button type="button" class="ghost" id="f-clear">Clear</button>
+  </div>
   </div>
   <div class="tabs" id="tabs"></div>
   <div class="mode-row" id="mode-row">
@@ -1064,6 +1081,8 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
     let io = null;
 
     const tabs = document.getElementById("tabs");
+    const filters = document.getElementById("filters");
+    const filtersToggleLabel = document.getElementById("filters-toggle-label");
     const modeRow = document.getElementById("mode-row");
     const feed = document.getElementById("feed");
     const stats = document.getElementById("stats");
@@ -1104,13 +1123,20 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
       var df = document.getElementById("f-from").value;
       var dt = document.getElementById("f-to").value;
       var ment = document.getElementById("f-mentions").value.trim();
+      var hideBots = document.getElementById("f-hide-bots").checked;
       if (q) p.set("q", q);
       if (aid) p.set("author_id", aid);
       if (an) p.set("author", an);
       if (df) p.set("date_from", new Date(df).toISOString());
       if (dt) p.set("date_to", new Date(dt).toISOString());
       if (ment) p.set("mentions", ment);
+      if (hideBots) p.set("hide_bots", "1");
       return p;
+    }
+
+    function setFiltersExpanded(expanded) {
+      filters.classList.toggle("show", expanded);
+      filtersToggleLabel.textContent = expanded ? "Hide" : "Show";
     }
 
     function resetAndLoad() {
@@ -1513,7 +1539,11 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
       document.getElementById("f-from").value = "";
       document.getElementById("f-to").value = "";
       document.getElementById("f-mentions").value = "";
+      document.getElementById("f-hide-bots").checked = true;
       resetAndLoad();
+    };
+    document.getElementById("filters-toggle").onclick = function () {
+      setFiltersExpanded(!filters.classList.contains("show"));
     };
     document.getElementById("mode-messages").onclick = function () {
       viewMode = "messages";
@@ -1526,6 +1556,7 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
       resetAndLoad();
     };
 
+    setFiltersExpanded(false);
     syncModeButtons();
     resetAndLoad();
     setupObserver();
