@@ -70,6 +70,34 @@ function joinBaseAndPath(base, path) {
   return `${cleanBase}/${parts.join("/")}`;
 }
 
+function rewriteSupabasePublicToCdn(url, cdnBase, bucket) {
+  const u = String(url || "").trim();
+  const base = String(cdnBase || "").trim().replace(/\/+$/, "");
+  const b = String(bucket || "archive-media").trim();
+  if (!u || !base) return u;
+  const marker = `/storage/v1/object/public/${b}/`;
+  const idx = u.indexOf(marker);
+  if (idx === -1) return u;
+  const rel = u.slice(idx + marker.length);
+  return joinBaseAndPath(base, rel);
+}
+
+function applyMediaCdnToRow(row, cdnBase, bucket) {
+  if (!row || !Array.isArray(row.attachments)) return row;
+  const out = { ...row };
+  out.attachments = row.attachments.map((a) => {
+    const x = { ...(a || {}) };
+    if (x.mirroredUrl) {
+      x.mirroredUrl = rewriteSupabasePublicToCdn(x.mirroredUrl, cdnBase, bucket);
+    }
+    if (x.mirrored_url) {
+      x.mirrored_url = rewriteSupabasePublicToCdn(x.mirrored_url, cdnBase, bucket);
+    }
+    return x;
+  });
+  return out;
+}
+
 async function mirrorAttachmentToBunny(attachment, ctx, cfg) {
   if (!cfg?.bunnyEndpoint || !cfg?.bunnyAccessKey) return null;
   if (!attachmentLooksMedia(attachment)) return null;
@@ -534,6 +562,7 @@ function attachArchiveSystem(deps) {
     bunnyAccessKey: String(BUNNY_STORAGE_ACCESS_KEY || "").trim(),
     bunnyCdnBase: String(BUNNY_CDN_BASE || "").replace(/\/+$/, ""),
   };
+  const mediaCdnBase = String(BUNNY_CDN_BASE || "").trim().replace(/\/+$/, "");
 
   function buildSiteLoginUrl() {
     const params = new URLSearchParams({
@@ -664,7 +693,7 @@ function attachArchiveSystem(deps) {
 
     if (error) return res.status(500).json({ error: error.message });
     res.json({
-      rows: data || [],
+      rows: (data || []).map((r) => applyMediaCdnToRow(r, mediaCdnBase, mediaBackupCfg.bucket)),
       total: count ?? null,
       limit,
       offset,
@@ -700,7 +729,7 @@ function attachArchiveSystem(deps) {
       hasMore = true;
     }
     res.json({
-      rows: rows.slice(0, limit),
+      rows: rows.slice(0, limit).map((r) => applyMediaCdnToRow(r, mediaCdnBase, mediaBackupCfg.bucket)),
       total: null,
       limit,
       offset,
@@ -721,7 +750,7 @@ function attachArchiveSystem(deps) {
       .maybeSingle();
     if (error) return res.status(500).json({ error: error.message });
     if (!data) return res.status(404).json({ error: "not found" });
-    res.json({ row: data });
+    res.json({ row: applyMediaCdnToRow(data, mediaCdnBase, mediaBackupCfg.bucket) });
   });
 
   app.get("/archive/post/:channelId/:messageId", requireArchiveMember, async (req, res) => {
