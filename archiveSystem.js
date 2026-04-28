@@ -10,6 +10,7 @@ const {
 } = require("discord.js");
 
 const DISCORD_API = "https://discord.com/api/v10";
+let mediaBucketEnsurePromise = null;
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -52,6 +53,124 @@ function rowHasMedia(row) {
     if (attachmentLooksMedia(a)) return true;
   }
   return false;
+}
+
+function safeStorageName(s) {
+  return String(s || "")
+    .replace(/[^a-zA-Z0-9._-]/g, "_")
+    .slice(0, 120);
+}
+
+function joinBaseAndPath(base, path) {
+  const cleanBase = String(base || "").replace(/\/+$/, "");
+  const parts = String(path || "")
+    .split("/")
+    .filter(Boolean)
+    .map((p) => encodeURIComponent(p));
+  return `${cleanBase}/${parts.join("/")}`;
+}
+
+async function mirrorAttachmentToBunny(attachment, ctx, cfg) {
+  if (!cfg?.bunnyEndpoint || !cfg?.bunnyAccessKey) return null;
+  if (!attachmentLooksMedia(attachment)) return null;
+  const rawUrl = attachment?.url || attachment?.proxyUrl || attachment?.proxy_url;
+  if (!rawUrl) return null;
+  const size = Number(attachment?.size || 0);
+  if (size > 0 && size > cfg.maxBytes) return null;
+
+  const name = safeStorageName(attachment?.name || `media-${ctx.index}`);
+  const path = `${ctx.guildId}/${ctx.channelId}/${ctx.messageId}/${ctx.index}-${name}`;
+
+  try {
+    const fr = await fetch(rawUrl);
+    if (!fr.ok) return null;
+    const ab = await fr.arrayBuffer();
+    if (cfg.maxBytes > 0 && ab.byteLength > cfg.maxBytes) return null;
+    const payload = Buffer.from(ab);
+    const uploadUrl = joinBaseAndPath(cfg.bunnyEndpoint, path);
+    const putResp = await fetch(uploadUrl, {
+      method: "PUT",
+      headers: {
+        AccessKey: cfg.bunnyAccessKey,
+        "Content-Type": attachment?.contentType || "application/octet-stream",
+      },
+      body: payload,
+    });
+    if (!putResp.ok) {
+      const t = await putResp.text().catch(() => "");
+      console.warn(`[archive] bunny upload failed ${putResp.status}: ${String(t).slice(0, 180)}`);
+      return null;
+    }
+    const readBase = cfg.bunnyCdnBase || cfg.bunnyEndpoint;
+    return joinBaseAndPath(readBase, path);
+  } catch (e) {
+    console.warn("[archive] bunny mirror fetch/upload error:", e.message);
+    return null;
+  }
+}
+
+async function ensureMediaBucket(supabase, bucketName) {
+  if (mediaBucketEnsurePromise) return mediaBucketEnsurePromise;
+  mediaBucketEnsurePromise = (async () => {
+    try {
+      const { data: buckets, error: listErr } = await supabase.storage.listBuckets();
+      if (listErr) {
+        console.warn("[archive] storage listBuckets failed:", listErr.message);
+        return;
+      }
+      const exists = (buckets || []).some((b) => String(b.name || b.id) === bucketName);
+      if (exists) return;
+      const { error: createErr } = await supabase.storage.createBucket(bucketName, {
+        public: true,
+      });
+      if (createErr) {
+        console.warn("[archive] storage createBucket failed:", createErr.message);
+      } else {
+        console.log(`[archive] created storage bucket '${bucketName}' (public)`);
+      }
+    } catch (e) {
+      console.warn("[archive] storage bucket ensure failed:", e.message);
+    }
+  })();
+  return mediaBucketEnsurePromise;
+}
+
+async function mirrorAttachmentToStorage(supabase, attachment, ctx, cfg) {
+  if (!cfg?.enabled) return null;
+  if (cfg?.provider === "bunny") {
+    return mirrorAttachmentToBunny(attachment, ctx, cfg);
+  }
+  if (!attachmentLooksMedia(attachment)) return null;
+  const rawUrl = attachment?.url || attachment?.proxyUrl || attachment?.proxy_url;
+  if (!rawUrl) return null;
+  const size = Number(attachment?.size || 0);
+  if (size > 0 && size > cfg.maxBytes) return null;
+
+  const name = safeStorageName(attachment?.name || `media-${ctx.index}`);
+  const path = `${ctx.guildId}/${ctx.channelId}/${ctx.messageId}/${ctx.index}-${name}`;
+  await ensureMediaBucket(supabase, cfg.bucket);
+
+  try {
+    const fr = await fetch(rawUrl);
+    if (!fr.ok) return null;
+    const ab = await fr.arrayBuffer();
+    if (cfg.maxBytes > 0 && ab.byteLength > cfg.maxBytes) return null;
+    const payload = Buffer.from(ab);
+    const { error } = await supabase.storage.from(cfg.bucket).upload(path, payload, {
+      contentType: attachment?.contentType || "application/octet-stream",
+      upsert: false,
+      cacheControl: "31536000",
+    });
+    if (error && !/already exists|duplicate/i.test(String(error.message || ""))) {
+      console.warn("[archive] media mirror upload failed:", error.message);
+      return null;
+    }
+    const pub = supabase.storage.from(cfg.bucket).getPublicUrl(path);
+    return pub?.data?.publicUrl || null;
+  } catch (e) {
+    console.warn("[archive] media mirror fetch/upload error:", e.message);
+    return null;
+  }
 }
 
 function buildAuthorRolesSnapshot(member, guildSnowflakeId) {
@@ -102,7 +221,7 @@ function replyPreviewFromMessage(refMsg) {
   return "";
 }
 
-async function insertArchiveMessage(supabase, message) {
+async function insertArchiveMessage(supabase, message, mediaCfg = null) {
   let member = message.member;
   if (!member && message.guild && message.author?.id) {
     try {
@@ -133,10 +252,32 @@ async function insertArchiveMessage(supabase, message) {
   const mentionUserIds = extractMentionUserIds(message);
   const authorRoles = buildAuthorRolesSnapshot(member, message.guild?.id);
 
-  const attachments = message.attachments?.size
-    ? [...message.attachments.values()].map((a) => ({
+  const attachments = [];
+  if (message.attachments?.size) {
+    const list = [...message.attachments.values()];
+    for (let i = 0; i < list.length; i++) {
+      const a = list[i];
+      const mirroredUrl = await mirrorAttachmentToStorage(
+        supabase,
+        {
+          url: a.url,
+          proxyUrl: a.proxyURL ?? a.proxyUrl,
+          name: a.name || null,
+          contentType: a.contentType || null,
+          size: a.size ?? null,
+        },
+        {
+          guildId: String(message.guildId || "0"),
+          channelId: String(message.channelId || "0"),
+          messageId: String(message.id || "0"),
+          index: i,
+        },
+        mediaCfg
+      );
+      attachments.push({
         url: a.url,
         proxyUrl: a.proxyURL ?? a.proxyUrl,
+        mirroredUrl: mirroredUrl || null,
         name: a.name || null,
         contentType: a.contentType || null,
         size: a.size ?? null,
@@ -144,8 +285,9 @@ async function insertArchiveMessage(supabase, message) {
         height: a.height ?? null,
         duration: a.duration ?? null,
         ephemeral: Boolean(a.ephemeral),
-      }))
-    : [];
+      });
+    }
+  }
   const embeds = message.embeds?.size
     ? [...message.embeds.values()].map((e) => e.toJSON())
     : [];
@@ -370,10 +512,28 @@ function attachArchiveSystem(deps) {
     CHANNEL_LABELS,
     SPECIAL_MEDIA_CHANNEL_ID,
     CHANNEL_NUKE_INTERVAL_MS,
+    MEDIA_BACKUP_ENABLED,
+    MEDIA_BACKUP_BUCKET,
+    MEDIA_BACKUP_MAX_BYTES,
+    BUNNY_STORAGE_ENDPOINT,
+    BUNNY_STORAGE_ACCESS_KEY,
+    BUNNY_CDN_BASE,
   } = deps;
 
   const authRedirect = SITE_AUTH_REDIRECT_URI;
   const mediaChannelId = String(SPECIAL_MEDIA_CHANNEL_ID || "").trim();
+  const mediaBackupCfg = {
+    enabled: MEDIA_BACKUP_ENABLED !== false,
+    bucket: String(MEDIA_BACKUP_BUCKET || "archive-media").trim() || "archive-media",
+    maxBytes: Math.max(1, Number(MEDIA_BACKUP_MAX_BYTES || 125 * 1024 * 1024) || 125 * 1024 * 1024),
+    provider:
+      String(BUNNY_STORAGE_ENDPOINT || "").trim() && String(BUNNY_STORAGE_ACCESS_KEY || "").trim()
+        ? "bunny"
+        : "supabase",
+    bunnyEndpoint: String(BUNNY_STORAGE_ENDPOINT || "").replace(/\/+$/, ""),
+    bunnyAccessKey: String(BUNNY_STORAGE_ACCESS_KEY || "").trim(),
+    bunnyCdnBase: String(BUNNY_CDN_BASE || "").replace(/\/+$/, ""),
+  };
 
   function buildSiteLoginUrl() {
     const params = new URLSearchParams({
@@ -578,7 +738,7 @@ function attachArchiveSystem(deps) {
   bot.on("messageCreate", async (message) => {
     if (!message.guild) return;
     if (!ARCHIVE_CHANNEL_IDS.includes(String(message.channelId))) return;
-    await insertArchiveMessage(supabase, message);
+    await insertArchiveMessage(supabase, message, mediaBackupCfg);
   });
 
   const defaultIntervalMs = Math.max(60 * 1000, NUKE_INTERVAL_MS || 24 * 60 * 60 * 1000);
@@ -702,7 +862,7 @@ function attachArchiveSystem(deps) {
         if (!m.guild) continue;
         if (!m.attachments?.size) continue;
         if (![...m.attachments.values()].some(attachmentLooksMedia)) continue;
-        await insertArchiveMessage(supabase, m);
+        await insertArchiveMessage(supabase, m, mediaBackupCfg);
         inserted += 1;
       }
       before = rows[rows.length - 1]?.id;
@@ -712,6 +872,9 @@ function attachArchiveSystem(deps) {
   }
 
   bot.once("ready", () => {
+    if (mediaBackupCfg.provider === "supabase") {
+      void ensureMediaBucket(supabase, mediaBackupCfg.bucket);
+    }
     scheduleNuksFromDb();
     void backfillMediaChannelHistory();
   });
@@ -885,7 +1048,9 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
       if (id === active) b.classList.add("active");
       b.onclick = () => {
         active = id;
-        if (active !== MEDIA_CHANNEL_ID) viewMode = "messages";
+        // Always default to chat view when selecting a channel tab.
+        // Blood channel still has a separate Media tab, but it won't open media-only by default.
+        viewMode = "messages";
         [...tabs.querySelectorAll("button")].forEach((x) => x.classList.toggle("active", x.dataset.id === active));
         syncModeButtons();
         resetAndLoad();
@@ -1157,7 +1322,7 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
       var html = "";
       for (var i = 0; i < att.length; i++) {
         var a = att[i];
-        var url = a.proxyUrl || a.proxy_url || a.url || "";
+        var url = a.mirroredUrl || a.mirrored_url || a.proxyUrl || a.proxy_url || a.url || "";
         var ct = String(a.contentType || a.content_type || "").toLowerCase();
         var name = a.name || "attachment";
         if (!url) continue;
@@ -1334,7 +1499,7 @@ function archivePostHtml(siteBase, user, channelId, messageId, channelTitle) {
       var html = "";
       for (var i = 0; i < att.length; i++) {
         var a = att[i] || {};
-        var url = a.proxyUrl || a.proxy_url || a.url || "";
+        var url = a.mirroredUrl || a.mirrored_url || a.proxyUrl || a.proxy_url || a.url || "";
         var ct = String(a.contentType || a.content_type || "").toLowerCase();
         var name = a.name || "attachment";
         if (!url) continue;

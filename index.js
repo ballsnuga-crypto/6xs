@@ -86,6 +86,15 @@ if (!ARCHIVE_CHANNEL_IDS.includes(MEDIA_ARCHIVE_CHANNEL_ID)) {
 const CHANNEL_NUKE_INTERVAL_MS = {
   [MEDIA_ARCHIVE_CHANNEL_ID]: 30 * 60 * 1000,
 };
+const MEDIA_BACKUP_ENABLED = String(process.env.ARCHIVE_MEDIA_BACKUP_ENABLED || "1").trim() !== "0";
+const MEDIA_BACKUP_BUCKET = String(process.env.ARCHIVE_MEDIA_BUCKET || "archive-media").trim() || "archive-media";
+const MEDIA_BACKUP_MAX_BYTES = Math.max(
+  1024 * 1024,
+  parseInt(process.env.ARCHIVE_MEDIA_MAX_BYTES || `${125 * 1024 * 1024}`, 10) || 125 * 1024 * 1024
+);
+const BUNNY_STORAGE_ENDPOINT = String(process.env.BUNNY_STORAGE_ENDPOINT || "").trim();
+const BUNNY_STORAGE_ACCESS_KEY = String(process.env.BUNNY_STORAGE_ACCESS_KEY || "").trim();
+const BUNNY_CDN_BASE = String(process.env.BUNNY_CDN_BASE || "").trim();
 
 function safeSiteHostname() {
   try {
@@ -1091,6 +1100,12 @@ attachArchiveSystem({
   CHANNEL_LABELS,
   SPECIAL_MEDIA_CHANNEL_ID: MEDIA_ARCHIVE_CHANNEL_ID,
   CHANNEL_NUKE_INTERVAL_MS,
+  MEDIA_BACKUP_ENABLED,
+  MEDIA_BACKUP_BUCKET,
+  MEDIA_BACKUP_MAX_BYTES,
+  BUNNY_STORAGE_ENDPOINT,
+  BUNNY_STORAGE_ACCESS_KEY,
+  BUNNY_CDN_BASE,
 });
 
 bot.once("ready", () => {
