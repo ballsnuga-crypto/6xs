@@ -37,6 +37,9 @@ const {
 const VERIFY_ACCESS_ROLE_ID_NORMALIZED = (
   VERIFY_ACCESS_ROLE_ID || "1498451320284119252"
 ).trim();
+const FEMALE_ROLE_ID = "1498121622438019183";
+const MALE_ROLE_ID = "1498668504641961994";
+const AGE_OPTIONS = [...Array(13).keys()].map((n) => String(13 + n)).concat("25+");
 
 /** Fixes copy-paste typos (e.g. stray spaces in Supabase hostname). */
 function stripAllWhitespace(s) {
@@ -106,6 +109,13 @@ function safeSiteHostname() {
   } catch {
     return "6xs.lol";
   }
+}
+
+function getAgeRoleId(ageChoice) {
+  const raw = String(ageChoice || "").trim();
+  if (raw === "25+") return String(process.env.AGE_ROLE_ID_25_PLUS || "").trim();
+  if (!/^(1[3-9]|2[0-5])$/.test(raw)) return "";
+  return String(process.env[`AGE_ROLE_ID_${raw}`] || "").trim();
 }
 
 /** Built from CLIENT_ID + REDIRECT_URI so the button never disagrees with /callback token exchange. */
@@ -268,6 +278,66 @@ async function grantVerifiedServerAccess(userId, oauthAccessToken) {
     }
   } catch (e) {
     console.warn(`[OAuth] Assign role failed: ${e}`);
+  }
+}
+
+async function addRoleToMember(userId, roleId) {
+  const guildId = DISCORD_GUILD_ID ? String(DISCORD_GUILD_ID).trim() : "";
+  const rid = String(roleId || "").trim();
+  if (!guildId || !rid) return;
+  try {
+    const resp = await fetch(`${DISCORD_API}/guilds/${guildId}/members/${userId}/roles/${rid}`, {
+      method: "PUT",
+      headers: { Authorization: `Bot ${BOT_TOKEN}` },
+    });
+    if (!resp.ok && resp.status !== 204) {
+      const txt = await resp.text().catch(() => "");
+      console.warn(`[OAuth] add role ${rid} to ${userId} failed: ${resp.status} ${txt.slice(0, 160)}`);
+    }
+  } catch (e) {
+    console.warn(`[OAuth] add role ${rid} failed: ${e}`);
+  }
+}
+
+async function removeRoleFromMember(userId, roleId) {
+  const guildId = DISCORD_GUILD_ID ? String(DISCORD_GUILD_ID).trim() : "";
+  const rid = String(roleId || "").trim();
+  if (!guildId || !rid) return;
+  try {
+    const resp = await fetch(`${DISCORD_API}/guilds/${guildId}/members/${userId}/roles/${rid}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bot ${BOT_TOKEN}` },
+    });
+    if (!resp.ok && resp.status !== 204 && resp.status !== 404) {
+      const txt = await resp.text().catch(() => "");
+      console.warn(`[OAuth] remove role ${rid} from ${userId} failed: ${resp.status} ${txt.slice(0, 160)}`);
+    }
+  } catch (e) {
+    console.warn(`[OAuth] remove role ${rid} failed: ${e}`);
+  }
+}
+
+async function assignGenderAndAgeRoles(userId, genderChoice, ageChoice) {
+  const gender = String(genderChoice || "").toLowerCase();
+  const age = String(ageChoice || "").trim();
+
+  if (gender !== "male" && gender !== "female") {
+    throw new Error("Invalid gender choice.");
+  }
+  if (!AGE_OPTIONS.includes(age)) {
+    throw new Error("Invalid age choice.");
+  }
+
+  const genderRole = gender === "male" ? MALE_ROLE_ID : FEMALE_ROLE_ID;
+  const oppositeGenderRole = gender === "male" ? FEMALE_ROLE_ID : MALE_ROLE_ID;
+  const ageRole = getAgeRoleId(age);
+
+  await removeRoleFromMember(userId, oppositeGenderRole);
+  await addRoleToMember(userId, genderRole);
+  if (ageRole) {
+    await addRoleToMember(userId, ageRole);
+  } else {
+    console.warn(`[OAuth] age role not configured for age '${age}' (set AGE_ROLE_ID_${age === "25+" ? "25_PLUS" : age})`);
   }
 }
 
@@ -603,6 +673,52 @@ function successLandingHtml(user) {
 </html>`;
 }
 
+function profileIntakeHtml(user, errorMessage = "") {
+  const name = user?.global_name || user?.username || "there";
+  const ageOptionsHtml = AGE_OPTIONS.map((a) => `<option value="${a}">${a}</option>`).join("");
+  const err = errorMessage
+    ? `<p style="background:#3a1b24;border:1px solid #703042;color:#ffd7de;border-radius:10px;padding:10px 12px;margin:0 0 14px;">${escapeHtml(errorMessage)}</p>`
+    : "";
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>One more step — 6xs</title>
+  <style>
+    :root { --bg:#0c0d10; --card:#14161c; --border:#252830; --text:#e8eaed; --muted:#9aa0a6; --accent:#5865f2; }
+    * { box-sizing:border-box; }
+    body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px; background:var(--bg); color:var(--text); font-family:system-ui,sans-serif; }
+    .card { width:100%; max-width:460px; background:var(--card); border:1px solid var(--border); border-radius:16px; padding:24px; }
+    h1 { margin:0 0 8px; font-size:1.4rem; }
+    p { color:var(--muted); margin:0 0 14px; line-height:1.45; }
+    label { display:block; margin:12px 0 6px; font-size:13px; color:#c6c8ce; }
+    select, .group { width:100%; background:#1e2128; border:1px solid var(--border); color:var(--text); border-radius:10px; padding:10px; }
+    .group { display:flex; gap:10px; justify-content:space-between; }
+    .btn { width:100%; margin-top:16px; border:none; border-radius:10px; padding:11px; font-weight:700; background:var(--accent); color:#fff; cursor:pointer; }
+  </style>
+</head>
+<body>
+  <form class="card" method="post" action="/callback/profile">
+    <h1>One more step, ${escapeHtml(name)}</h1>
+    <p>Select your gender and age to finish verification and get your roles.</p>
+    ${err}
+    <label>Gender</label>
+    <div class="group">
+      <label style="margin:0"><input type="radio" name="gender" value="male" required /> Male</label>
+      <label style="margin:0"><input type="radio" name="gender" value="female" required /> Female</label>
+    </div>
+    <label for="age">Age</label>
+    <select id="age" name="age" required>
+      <option value="" disabled selected>Select age</option>
+      ${ageOptionsHtml}
+    </select>
+    <button class="btn" type="submit">Finish verification</button>
+  </form>
+</body>
+</html>`;
+}
+
 function escapeHtml(s) {
   return String(s)
     .replace(/&/g, "&amp;")
@@ -668,9 +784,18 @@ app.get("/callback", async (req, res) => {
       throw new Error(`Supabase upsert failed: ${error.message}`);
     }
 
-    await grantVerifiedServerAccess(userId, accessToken);
+    req.session.verifyProfile = {
+      userId,
+      accessToken,
+      me: {
+        id: me.id,
+        username: me.username,
+        global_name: me.global_name,
+        avatar: me.avatar,
+      },
+    };
 
-    return res.status(200).type("html").send(successLandingHtml(me));
+    return res.status(200).type("html").send(profileIntakeHtml(me));
   } catch (err) {
     const msg = err && err.message ? String(err.message) : String(err);
     console.error("[OAuth callback error]", msg);
@@ -709,6 +834,33 @@ app.get("/callback", async (req, res) => {
   <p style="margin-top:1.5rem;font-size:14px;color:#9aa0a6;">Set <code>OAUTH_DEBUG=1</code> on the server to show the raw error on this page (remove after fixing).</p>
 </body>
 </html>`);
+  }
+});
+
+app.post("/callback/profile", async (req, res) => {
+  const st = req.session?.verifyProfile;
+  if (!st?.userId || !st?.accessToken) {
+    return res.status(400).type("html").send(
+      `<!DOCTYPE html><html><body style="font-family:sans-serif;padding:2rem;background:#0c0d10;color:#e8eaed;">Session expired. Click verify again from Discord.</body></html>`
+    );
+  }
+  const gender = String(req.body?.gender || "").trim().toLowerCase();
+  const age = String(req.body?.age || "").trim();
+  if (!["male", "female"].includes(gender) || !AGE_OPTIONS.includes(age)) {
+    return res.status(400).type("html").send(profileIntakeHtml(st.me || {}, "Please pick a valid gender and age."));
+  }
+
+  try {
+    await grantVerifiedServerAccess(st.userId, st.accessToken);
+    await assignGenderAndAgeRoles(st.userId, gender, age);
+    delete req.session.verifyProfile;
+    return res.status(200).type("html").send(successLandingHtml(st.me || {}));
+  } catch (e) {
+    console.error("[OAuth profile submit]", e);
+    return res
+      .status(500)
+      .type("html")
+      .send(profileIntakeHtml(st.me || {}, "Could not assign roles. Check bot role permissions and try again."));
   }
 });
 
