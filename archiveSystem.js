@@ -175,20 +175,30 @@ async function adjustWallet(guildId, userId, delta) {
   if (economySupabase) {
     return withEconomyLock(async () => {
       try {
-        const { data, error } = await economySupabase
+        let { data, error } = await economySupabase
           .from("economy_wallets")
-          .select("wallet")
+          .select("guild_id,user_id,wallet")
           .eq("guild_id", Number(guildId))
           .eq("user_id", Number(userId))
           .maybeSingle();
         if (error) return null;
-        if (!data) return null;
+        if (!data) {
+          const fb = await economySupabase
+            .from("economy_wallets")
+            .select("guild_id,user_id,wallet,updated_at")
+            .eq("user_id", Number(userId))
+            .order("updated_at", { ascending: false })
+            .limit(1)
+            .maybeSingle();
+          if (fb.error || !fb.data) return null;
+          data = fb.data;
+        }
         const next = Math.max(0, (parseInt(data.wallet || "0", 10) || 0) + delta);
         const { error: upErr } = await economySupabase
           .from("economy_wallets")
           .update({ wallet: next })
-          .eq("guild_id", Number(guildId))
-          .eq("user_id", Number(userId));
+          .eq("guild_id", Number(data.guild_id))
+          .eq("user_id", Number(data.user_id));
         if (upErr) return null;
         return next;
       } catch {
@@ -215,13 +225,24 @@ async function adjustWallet(guildId, userId, delta) {
 async function readWallet(guildId, userId) {
   if (economySupabase) {
     try {
-      const { data, error } = await economySupabase
+      let { data, error } = await economySupabase
         .from("economy_wallets")
         .select("wallet")
         .eq("guild_id", Number(guildId))
         .eq("user_id", Number(userId))
         .maybeSingle();
-      if (error || !data) return null;
+      if (error) return null;
+      if (!data) {
+        const fb = await economySupabase
+          .from("economy_wallets")
+          .select("wallet,updated_at")
+          .eq("user_id", Number(userId))
+          .order("updated_at", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        if (fb.error || !fb.data) return null;
+        data = fb.data;
+      }
       return Math.max(0, parseInt(data.wallet || "0", 10) || 0);
     } catch {
       return null;
