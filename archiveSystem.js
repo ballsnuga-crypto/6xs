@@ -14,7 +14,9 @@ const path = require("path");
 const DISCORD_API = "https://discord.com/api/v10";
 let mediaBucketEnsurePromise = null;
 let economySupabase = null;
-const ECONOMY_FILE = path.resolve(__dirname, "..", "economy_data.json");
+const ECONOMY_FILE = process.env.ECONOMY_FILE_PATH
+  ? path.resolve(String(process.env.ECONOMY_FILE_PATH))
+  : path.resolve(__dirname, "..", "economy_data.json");
 const START_WALLET = 500;
 let economyLock = Promise.resolve();
 
@@ -872,6 +874,72 @@ function attachArchiveSystem(deps) {
     res.setHeader("Cache-Control", "no-store");
     if (wallet == null) return res.status(404).json({ error: "No server balance profile found yet. Use economy command in Discord first." });
     res.json({ wallet });
+  });
+
+  app.get("/api/casino/debug-balance", requireArchiveMember, async (req, res) => {
+    const u = req.session.archiveUser;
+    const out = {
+      userId: String(u.id),
+      guildId: String(casinoGuildId),
+      hasSupabaseClient: Boolean(economySupabase),
+      economyFilePath: ECONOMY_FILE,
+      sourcesTried: [],
+      wallet: null,
+    };
+
+    if (economySupabase) {
+      out.sourcesTried.push("supabase");
+      try {
+        const primary = await economySupabase
+          .from("economy_wallets")
+          .select("guild_id,user_id,wallet,updated_at")
+          .eq("guild_id", Number(casinoGuildId))
+          .eq("user_id", Number(u.id))
+          .maybeSingle();
+        if (primary.error) {
+          out.supabasePrimaryError = String(primary.error.message || "query failed");
+        } else if (primary.data) {
+          out.supabasePrimary = primary.data;
+          out.wallet = Math.max(0, parseInt(primary.data.wallet || "0", 10) || 0);
+        }
+
+        if (out.wallet == null) {
+          const fallback = await economySupabase
+            .from("economy_wallets")
+            .select("guild_id,user_id,wallet,updated_at")
+            .eq("user_id", Number(u.id))
+            .order("updated_at", { ascending: false })
+            .limit(1)
+            .maybeSingle();
+          if (fallback.error) {
+            out.supabaseFallbackError = String(fallback.error.message || "query failed");
+          } else if (fallback.data) {
+            out.supabaseFallback = fallback.data;
+            out.wallet = Math.max(0, parseInt(fallback.data.wallet || "0", 10) || 0);
+          }
+        }
+      } catch (e) {
+        out.supabaseException = String(e?.message || e);
+      }
+    }
+
+    if (out.wallet == null) {
+      out.sourcesTried.push("local_file");
+      try {
+        const all = await readEconomyData();
+        const key = resolveEconomyKey(all, casinoGuildId, u.id);
+        out.localKey = key;
+        out.localKeyExists = Boolean(all[key] && typeof all[key] === "object");
+        if (out.localKeyExists) {
+          out.wallet = getWalletFromEntry(all[key]);
+        }
+      } catch (e) {
+        out.localFileException = String(e?.message || e);
+      }
+    }
+
+    res.setHeader("Cache-Control", "no-store");
+    res.json(out);
   });
 
   app.post("/api/casino/blackjack/start", requireArchiveMember, async (req, res) => {
