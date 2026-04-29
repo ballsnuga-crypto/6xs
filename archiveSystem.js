@@ -650,6 +650,15 @@ function handTotal(cards) {
   return total;
 }
 
+function minesMultiplier(tiles, mines, picks) {
+  let mult = 1;
+  const safePicks = Math.max(0, Math.min(picks, tiles - mines));
+  for (let i = 0; i < safePicks; i++) {
+    mult *= (tiles - i) / (tiles - mines - i);
+  }
+  return Number((mult * 0.96).toFixed(4));
+}
+
 function attachArchiveSystem(deps) {
   const {
     app,
@@ -911,6 +920,86 @@ function attachArchiveSystem(deps) {
       tiles,
       mines,
       picks,
+    });
+  });
+
+  app.post("/api/casino/mines/start", requireArchiveMember, async (req, res) => {
+    const u = req.session.archiveUser;
+    const bet = Math.max(1, parseInt(req.body?.bet || "0", 10) || 0);
+    const tiles = Math.max(5, Math.min(25, parseInt(req.body?.tiles || "25", 10) || 25));
+    const mines = Math.max(1, Math.min(24, parseInt(req.body?.mines || "3", 10) || 3));
+    if (mines >= tiles) return res.status(400).json({ error: "Mines must be less than tiles." });
+    const wallet = await readWallet(ARCHIVE_GUILD_ID, u.id);
+    if (bet <= 0 || bet > wallet) return res.status(400).json({ error: "Invalid bet amount." });
+    const walletAfterBet = await adjustWallet(ARCHIVE_GUILD_ID, u.id, -bet);
+
+    const pool = [...Array(tiles).keys()];
+    for (let i = pool.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [pool[i], pool[j]] = [pool[j], pool[i]];
+    }
+    const mineTiles = pool.slice(0, mines);
+    req.session.casino = req.session.casino || {};
+    req.session.casino.mines = {
+      bet,
+      tiles,
+      mines,
+      mineTiles,
+      picked: [],
+      done: false,
+    };
+    res.json({ wallet: walletAfterBet, tiles, mines, picked: [], multiplier: 1, potential_payout: 0 });
+  });
+
+  app.post("/api/casino/mines/pick", requireArchiveMember, async (req, res) => {
+    const u = req.session.archiveUser;
+    const game = req.session?.casino?.mines;
+    if (!game || game.done) return res.status(400).json({ error: "No active mines game." });
+    const tile = parseInt(req.body?.tile || "-1", 10);
+    if (!Number.isFinite(tile) || tile < 0 || tile >= game.tiles) return res.status(400).json({ error: "Invalid tile." });
+    if (game.picked.includes(tile)) return res.status(400).json({ error: "Tile already picked." });
+
+    if (game.mineTiles.includes(tile)) {
+      game.done = true;
+      req.session.casino.mines = null;
+      const walletNow = await readWallet(ARCHIVE_GUILD_ID, u.id);
+      return res.json({ done: true, hit_mine: true, tile, wallet: walletNow, picked: [...game.picked], reveal_mines: game.mineTiles });
+    }
+
+    game.picked.push(tile);
+    const mult = minesMultiplier(game.tiles, game.mines, game.picked.length);
+    const potential = Math.floor(game.bet * mult);
+    req.session.casino.mines = game;
+    const walletNow = await readWallet(ARCHIVE_GUILD_ID, u.id);
+    res.json({
+      done: false,
+      hit_mine: false,
+      tile,
+      wallet: walletNow,
+      picked: [...game.picked],
+      multiplier: mult,
+      potential_payout: potential,
+    });
+  });
+
+  app.post("/api/casino/mines/cashout", requireArchiveMember, async (req, res) => {
+    const u = req.session.archiveUser;
+    const game = req.session?.casino?.mines;
+    if (!game || game.done) return res.status(400).json({ error: "No active mines game." });
+    if (!game.picked.length) return res.status(400).json({ error: "Pick at least one tile first." });
+    const mult = minesMultiplier(game.tiles, game.mines, game.picked.length);
+    const payout = Math.floor(game.bet * mult);
+    const walletNow = await adjustWallet(ARCHIVE_GUILD_ID, u.id, payout);
+    req.session.casino.mines = null;
+    res.json({
+      done: true,
+      cashed_out: true,
+      multiplier: mult,
+      payout,
+      wallet: walletNow,
+      picked: [...game.picked],
+      tiles: game.tiles,
+      mines: game.mines,
     });
   });
 
@@ -2027,11 +2116,10 @@ function casinoGameHtml(siteBase, user, wallet, game) {
       <div class="out" id="cr-out"></div>` : ""}
       ${current === "mines" ? `
       <h2>Mines</h2>
-      <p>Set tiles/mines/picks and see revealed safe picks.</p>
+      <p>Start a board, click tiles, then cash out anytime before a mine.</p>
       <label>Bet</label><input id="mi-bet" type="number" min="1" value="100" />
       <div class="row"><div><label>Tiles</label><input id="mi-tiles" type="number" min="5" max="25" value="25" /></div><div><label>Mines</label><input id="mi-mines" type="number" min="1" max="24" value="3" /></div></div>
-      <label>Safe picks</label><input id="mi-picks" type="number" min="1" value="2" />
-      <button id="mi-play">Play Mines</button>
+      <div class="row"><button id="mi-start">Start game</button><button id="mi-cashout">Cash out</button></div>
       <div class="viz"><div class="mines-grid" id="mi-grid"></div></div>
       <div class="out" id="mi-out"></div>` : ""}
     </div>
@@ -2106,29 +2194,69 @@ function casinoGameHtml(siteBase, user, wallet, game) {
         } catch (e) { out.className = "out err"; out.textContent = e.message; }
       };
     } else if (game === "mines") {
-      function drawGrid(tiles, safeCount) {
+      var minesState = { active: false, tiles: 25, picked: [] };
+      function drawGrid(tiles, picked, revealMines) {
         var g = document.getElementById("mi-grid"); g.innerHTML = "";
         for (var i = 0; i < tiles; i++) {
           var d = document.createElement("div");
-          d.className = "tile" + (i < safeCount ? " safe" : "");
+          var isSafe = picked.indexOf(i) !== -1;
+          var isMine = Array.isArray(revealMines) && revealMines.indexOf(i) !== -1;
+          d.className = "tile" + (isSafe ? " safe" : "") + (isMine ? " err" : "");
           d.textContent = i + 1;
+          d.dataset.idx = String(i);
+          if (minesState.active && !isSafe) {
+            d.style.cursor = "pointer";
+            d.onclick = async function () {
+              var idx = Number(this.dataset.idx || -1);
+              if (idx < 0) return;
+              const out = document.getElementById("mi-out");
+              try {
+                const j = await post("/api/casino/mines/pick", { tile: idx });
+                setBal(j.wallet);
+                if (j.hit_mine) {
+                  minesState.active = false;
+                  drawGrid(minesState.tiles, j.picked || [], j.reveal_mines || []);
+                  out.className = "out err";
+                  out.textContent = "Boom. You hit a mine.";
+                } else {
+                  minesState.picked = j.picked || [];
+                  drawGrid(minesState.tiles, minesState.picked, null);
+                  out.className = "out";
+                  out.textContent = "Safe pick. Multiplier x" + j.multiplier + " · potential payout " + fmt(j.potential_payout);
+                }
+              } catch (e) { out.className = "out err"; out.textContent = e.message; }
+            };
+          }
           g.appendChild(d);
         }
       }
-      drawGrid(25, 0);
-      document.getElementById("mi-play").onclick = async function () {
+      drawGrid(25, [], null);
+      document.getElementById("mi-start").onclick = async function () {
         const out = document.getElementById("mi-out");
         try {
-          const j = await post("/api/casino/mines/play", {
+          const j = await post("/api/casino/mines/start", {
             bet: Number(document.getElementById("mi-bet").value || 0),
             tiles: Number(document.getElementById("mi-tiles").value || 25),
             mines: Number(document.getElementById("mi-mines").value || 3),
-            picks: Number(document.getElementById("mi-picks").value || 1),
           });
           setBal(j.wallet);
-          drawGrid(j.tiles, j.win ? j.picks : Math.max(0, j.picks - 1));
-          out.className = "out " + (j.win ? "ok" : "err");
-          out.textContent = (j.win ? "Safe picks hit." : "Hit a mine.") + " Multiplier x" + j.multiplier + " · payout " + fmt(j.payout);
+          minesState.active = true;
+          minesState.tiles = j.tiles;
+          minesState.picked = [];
+          drawGrid(j.tiles, [], null);
+          out.className = "out";
+          out.textContent = "Game started. Click tiles to reveal safe spots.";
+        } catch (e) { out.className = "out err"; out.textContent = e.message; }
+      };
+      document.getElementById("mi-cashout").onclick = async function () {
+        const out = document.getElementById("mi-out");
+        try {
+          const j = await post("/api/casino/mines/cashout", {});
+          minesState.active = false;
+          setBal(j.wallet);
+          drawGrid(j.tiles, j.picked || [], null);
+          out.className = "out ok";
+          out.textContent = "Cashed out at x" + j.multiplier + " · payout " + fmt(j.payout);
         } catch (e) { out.className = "out err"; out.textContent = e.message; }
       };
     }
