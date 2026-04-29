@@ -173,7 +173,7 @@ function getWalletFromEntry(entry) {
 
 async function adjustWallet(guildId, userId, delta) {
   if (economySupabase) {
-    return withEconomyLock(async () => {
+    const viaSupabase = await withEconomyLock(async () => {
       try {
         let { data, error } = await economySupabase
           .from("economy_wallets")
@@ -205,6 +205,7 @@ async function adjustWallet(guildId, userId, delta) {
         return null;
       }
     });
+    if (viaSupabase != null) return viaSupabase;
   }
   return withEconomyLock(async () => {
     const all = await readEconomyData();
@@ -231,7 +232,7 @@ async function readWallet(guildId, userId) {
         .eq("guild_id", Number(guildId))
         .eq("user_id", Number(userId))
         .maybeSingle();
-      if (error) return null;
+      if (error) data = null;
       if (!data) {
         const fb = await economySupabase
           .from("economy_wallets")
@@ -240,12 +241,11 @@ async function readWallet(guildId, userId) {
           .order("updated_at", { ascending: false })
           .limit(1)
           .maybeSingle();
-        if (fb.error || !fb.data) return null;
-        data = fb.data;
+        if (!fb.error && fb.data) data = fb.data;
       }
-      return Math.max(0, parseInt(data.wallet || "0", 10) || 0);
+      if (data) return Math.max(0, parseInt(data.wallet || "0", 10) || 0);
     } catch {
-      return null;
+      // fall through to file fallback
     }
   }
   const all = await readEconomyData();
@@ -1538,11 +1538,19 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
     const sentinel = document.getElementById("sentinel");
     const sentinelMsg = document.getElementById("sentinel-msg");
     function refreshTopBalance() {
-      fetch("/api/casino/balance", { cache: "no-store" }).then((r) => (r.ok ? r.json() : null)).then((j) => {
-        if (!j) return;
-        var b = Number(j.wallet || 0);
-        document.getElementById("top-balance").textContent = "Balance: " + b.toLocaleString() + " coins";
-      }).catch(() => {});
+      fetch("/api/casino/balance", { cache: "no-store" })
+        .then((r) => r.json().catch(() => null).then((j) => ({ ok: r.ok, j: j })))
+        .then((x) => {
+          if (!x || !x.ok || !x.j || x.j.wallet == null) {
+            document.getElementById("top-balance").textContent = "Balance: unavailable";
+            return;
+          }
+          var b = Number(x.j.wallet || 0);
+          document.getElementById("top-balance").textContent = "Balance: " + b.toLocaleString() + " coins";
+        })
+        .catch(() => {
+          document.getElementById("top-balance").textContent = "Balance: unavailable";
+        });
     }
     refreshTopBalance();
     setInterval(refreshTopBalance, 10000);
