@@ -8,9 +8,14 @@ const {
   ButtonBuilder,
   ButtonStyle,
 } = require("discord.js");
+const fs = require("fs/promises");
+const path = require("path");
 
 const DISCORD_API = "https://discord.com/api/v10";
 let mediaBucketEnsurePromise = null;
+const ECONOMY_FILE = path.resolve(__dirname, "..", "economy_data.json");
+const START_WALLET = 500;
+let economyLock = Promise.resolve();
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -124,6 +129,55 @@ function applyMediaCdnToRow(row, cdnBase, bucket) {
     return x;
   });
   return out;
+}
+
+function withEconomyLock(fn) {
+  const run = economyLock.then(fn, fn);
+  economyLock = run.catch(() => {});
+  return run;
+}
+
+async function readEconomyData() {
+  try {
+    const raw = await fs.readFile(ECONOMY_FILE, "utf-8");
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+async function saveEconomyData(data) {
+  const tmp = `${ECONOMY_FILE}.tmp`;
+  await fs.writeFile(tmp, JSON.stringify(data, null, 2), "utf-8");
+  await fs.rename(tmp, ECONOMY_FILE);
+}
+
+function economyKey(guildId, userId) {
+  return `${guildId}:${userId}`;
+}
+
+function getWalletFromEntry(entry) {
+  return Math.max(0, parseInt(entry?.wallet || START_WALLET, 10) || START_WALLET);
+}
+
+async function adjustWallet(guildId, userId, delta) {
+  return withEconomyLock(async () => {
+    const all = await readEconomyData();
+    const key = economyKey(guildId, userId);
+    const cur = all[key] && typeof all[key] === "object" ? all[key] : { wallet: START_WALLET, bank: 0 };
+    const next = Math.max(0, getWalletFromEntry(cur) + delta);
+    all[key] = { ...cur, wallet: next };
+    await saveEconomyData(all);
+    return next;
+  });
+}
+
+async function readWallet(guildId, userId) {
+  const all = await readEconomyData();
+  const key = economyKey(guildId, userId);
+  const cur = all[key] && typeof all[key] === "object" ? all[key] : { wallet: START_WALLET, bank: 0 };
+  return getWalletFromEntry(cur);
 }
 
 async function mirrorAttachmentToBunny(attachment, ctx, cfg) {
@@ -554,6 +608,39 @@ async function fetchDiscordMe(accessToken) {
   return meResp.json();
 }
 
+function cardDeck() {
+  const ranks = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"];
+  const suits = ["♠", "♥", "♦", "♣"];
+  const deck = [];
+  for (const r of ranks) for (const s of suits) deck.push(`${r}${s}`);
+  for (let i = deck.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [deck[i], deck[j]] = [deck[j], deck[i]];
+  }
+  return deck;
+}
+
+function cardValue(rank) {
+  if (rank === "A") return 11;
+  if (["K", "Q", "J"].includes(rank)) return 10;
+  return parseInt(rank, 10) || 0;
+}
+
+function handTotal(cards) {
+  let total = 0;
+  let aces = 0;
+  for (const c of cards) {
+    const r = c.slice(0, -1);
+    total += cardValue(r);
+    if (r === "A") aces += 1;
+  }
+  while (total > 21 && aces > 0) {
+    total -= 10;
+    aces -= 1;
+  }
+  return total;
+}
+
 function attachArchiveSystem(deps) {
   const {
     app,
@@ -668,6 +755,138 @@ function attachArchiveSystem(deps) {
     const u = req.session.archiveUser;
     const labels = CHANNEL_LABELS || {};
     res.type("html").send(archiveShellHtml(SITE_BASE, u, ARCHIVE_CHANNEL_IDS, labels, mediaChannelId));
+  });
+
+  app.get("/casino", requireArchiveMember, async (req, res) => {
+    const u = req.session.archiveUser;
+    const wallet = await readWallet(ARCHIVE_GUILD_ID, u.id);
+    res.type("html").send(casinoHtml(SITE_BASE, u, wallet));
+  });
+
+  app.get("/api/casino/balance", requireArchiveMember, async (req, res) => {
+    const u = req.session.archiveUser;
+    const wallet = await readWallet(ARCHIVE_GUILD_ID, u.id);
+    res.json({ wallet });
+  });
+
+  app.post("/api/casino/blackjack/start", requireArchiveMember, async (req, res) => {
+    const u = req.session.archiveUser;
+    const bet = Math.max(1, parseInt(req.body?.bet || "0", 10) || 0);
+    const wallet = await readWallet(ARCHIVE_GUILD_ID, u.id);
+    if (bet <= 0 || bet > wallet) return res.status(400).json({ error: "Invalid bet amount." });
+    const walletAfterBet = await adjustWallet(ARCHIVE_GUILD_ID, u.id, -bet);
+    const deck = cardDeck();
+    const player = [deck.pop(), deck.pop()];
+    const dealer = [deck.pop(), deck.pop()];
+    const state = { bet, deck, player, dealer, done: false };
+    req.session.casino = req.session.casino || {};
+    req.session.casino.bj = state;
+    const p = handTotal(player);
+    if (p === 21) {
+      const payout = Math.floor(bet * 2.5);
+      const walletNow = await adjustWallet(ARCHIVE_GUILD_ID, u.id, payout);
+      req.session.casino.bj = null;
+      return res.json({ done: true, result: "blackjack", payout, wallet: walletNow, player, dealer, playerTotal: p, dealerTotal: handTotal(dealer) });
+    }
+    res.json({ done: false, wallet: walletAfterBet, player, dealerUp: [dealer[0]], playerTotal: p });
+  });
+
+  app.post("/api/casino/blackjack/hit", requireArchiveMember, async (req, res) => {
+    const u = req.session.archiveUser;
+    const state = req.session?.casino?.bj;
+    if (!state || state.done) return res.status(400).json({ error: "No active blackjack round." });
+    state.player.push(state.deck.pop());
+    const p = handTotal(state.player);
+    if (p > 21) {
+      state.done = true;
+      req.session.casino.bj = null;
+      const wallet = await readWallet(ARCHIVE_GUILD_ID, u.id);
+      return res.json({ done: true, result: "bust", payout: 0, wallet, player: state.player, dealer: state.dealer, playerTotal: p, dealerTotal: handTotal(state.dealer) });
+    }
+    req.session.casino.bj = state;
+    const wallet = await readWallet(ARCHIVE_GUILD_ID, u.id);
+    res.json({ done: false, wallet, player: state.player, dealerUp: [state.dealer[0]], playerTotal: p });
+  });
+
+  app.post("/api/casino/blackjack/stand", requireArchiveMember, async (req, res) => {
+    const u = req.session.archiveUser;
+    const state = req.session?.casino?.bj;
+    if (!state || state.done) return res.status(400).json({ error: "No active blackjack round." });
+    while (handTotal(state.dealer) < 17) state.dealer.push(state.deck.pop());
+    const p = handTotal(state.player);
+    const d = handTotal(state.dealer);
+    let result = "lose";
+    let payout = 0;
+    if (d > 21 || p > d) {
+      result = "win";
+      payout = state.bet * 2;
+    } else if (p === d) {
+      result = "push";
+      payout = state.bet;
+    }
+    const wallet = payout > 0 ? await adjustWallet(ARCHIVE_GUILD_ID, u.id, payout) : await readWallet(ARCHIVE_GUILD_ID, u.id);
+    req.session.casino.bj = null;
+    res.json({ done: true, result, payout, wallet, player: state.player, dealer: state.dealer, playerTotal: p, dealerTotal: d });
+  });
+
+  app.post("/api/casino/crash/play", requireArchiveMember, async (req, res) => {
+    const u = req.session.archiveUser;
+    const bet = Math.max(1, parseInt(req.body?.bet || "0", 10) || 0);
+    const cashout = Math.max(1.01, Number(req.body?.cashout || 1.5));
+    const wallet = await readWallet(ARCHIVE_GUILD_ID, u.id);
+    if (bet <= 0 || bet > wallet) return res.status(400).json({ error: "Invalid bet amount." });
+    await adjustWallet(ARCHIVE_GUILD_ID, u.id, -bet);
+    const roll = Math.random();
+    const crashPoint = Math.max(1.0, Number((1 + (roll * 9.5)).toFixed(2)));
+    const win = cashout <= crashPoint;
+    const payout = win ? Math.floor(bet * cashout) : 0;
+    const walletNow = payout > 0 ? await adjustWallet(ARCHIVE_GUILD_ID, u.id, payout) : await readWallet(ARCHIVE_GUILD_ID, u.id);
+    res.json({ crashPoint, cashout, win, payout, wallet: walletNow });
+  });
+
+  app.post("/api/casino/mines/play", requireArchiveMember, async (req, res) => {
+    const u = req.session.archiveUser;
+    const bet = Math.max(1, parseInt(req.body?.bet || "0", 10) || 0);
+    const tiles = Math.max(5, Math.min(30, parseInt(req.body?.tiles || "25", 10) || 25));
+    const mines = Math.max(1, Math.min(24, parseInt(req.body?.mines || "3", 10) || 3));
+    const maxPicks = Math.max(1, tiles - mines);
+    const picks = Math.max(1, Math.min(maxPicks, parseInt(req.body?.picks || "1", 10) || 1));
+    if (mines >= tiles) return res.status(400).json({ error: "Mines must be less than tiles." });
+    const wallet = await readWallet(ARCHIVE_GUILD_ID, u.id);
+    if (bet <= 0 || bet > wallet) return res.status(400).json({ error: "Invalid bet amount." });
+    await adjustWallet(ARCHIVE_GUILD_ID, u.id, -bet);
+
+    const pool = [...Array(tiles).keys()];
+    for (let i = pool.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [pool[i], pool[j]] = [pool[j], pool[i]];
+    }
+    const mineSet = new Set(pool.slice(0, mines));
+    const pickPool = [...Array(tiles).keys()].filter((i) => !mineSet.has(i));
+    for (let i = pickPool.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [pickPool[i], pickPool[j]] = [pickPool[j], pickPool[i]];
+    }
+    const chosen = pickPool.slice(0, picks);
+    const hitMine = chosen.some((x) => mineSet.has(x));
+    let mult = 1;
+    if (!hitMine) {
+      for (let i = 0; i < picks; i++) {
+        mult *= (tiles - i) / (tiles - mines - i);
+      }
+      mult *= 0.96;
+    }
+    const payout = hitMine ? 0 : Math.floor(bet * mult);
+    const walletNow = payout > 0 ? await adjustWallet(ARCHIVE_GUILD_ID, u.id, payout) : await readWallet(ARCHIVE_GUILD_ID, u.id);
+    res.json({
+      win: !hitMine,
+      payout,
+      multiplier: Number(mult.toFixed(3)),
+      wallet: walletNow,
+      tiles,
+      mines,
+      picks,
+    });
   });
 
   app.get("/api/archive/:channelId", requireArchiveMember, async (req, res) => {
@@ -1066,7 +1285,7 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
 <body class="archive-page">
   <header>
     <span>Signed in as <strong>${name}</strong></span>
-    <span><a href="/">Home</a> · <a href="/auth/logout">Log out</a></span>
+    <span><a href="/">Home</a> · <a href="/casino">Casino</a> · <span id="top-balance">Balance: …</span> · <a href="/auth/logout">Log out</a></span>
   </header>
   <div class="filters-wrap">
     <button type="button" class="filters-toggle" id="filters-toggle">
@@ -1116,6 +1335,11 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
     const stats = document.getElementById("stats");
     const sentinel = document.getElementById("sentinel");
     const sentinelMsg = document.getElementById("sentinel-msg");
+    fetch("/api/casino/balance").then((r) => (r.ok ? r.json() : null)).then((j) => {
+      if (!j) return;
+      var b = Number(j.wallet || 0);
+      document.getElementById("top-balance").textContent = "Balance: " + b.toLocaleString() + " coins";
+    }).catch(() => {});
 
     CHANNEL_IDS.forEach((id) => {
       const b = document.createElement("button");
@@ -1310,7 +1534,7 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
 
     function renderRoles(roles) {
       if (!Array.isArray(roles) || !roles.length) return "";
-      var PREVIEW = 5;
+      var PREVIEW = 1;
       var previewRoles = roles.slice(0, PREVIEW);
       var out = '<div class="role-row">';
       for (var i = 0; i < previewRoles.length; i++) {
@@ -1712,6 +1936,128 @@ function archivePostHtml(siteBase, user, channelId, messageId, channelTitle) {
       .catch(function () {
         document.getElementById("post").innerHTML = '<div class="meta">Post not found.</div>';
       });
+  </script>
+</body>
+</html>`;
+}
+
+function casinoHtml(siteBase, user, wallet) {
+  const name = escapeHtml(user.global_name || user.username || "member");
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Casino — 6xs</title>
+  <style>
+    :root { --bg:#0c0d10; --panel:#14161c; --border:#252830; --text:#e8eaed; --muted:#9aa0a6; --accent:#5865f2; --good:#3ba55d; --bad:#ed4245; }
+    * { box-sizing:border-box; } body { margin:0; font-family:system-ui,sans-serif; background:var(--bg); color:var(--text); }
+    header { padding:14px 18px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; flex-wrap:wrap; gap:8px; }
+    header a { color:#8ea1ff; } .wrap { max-width:1100px; margin:0 auto; padding:16px; }
+    .bal { color:#d3f9d8; } .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:12px; }
+    .card { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:14px; }
+    h2 { margin:0 0 8px; font-size:1.05rem; } p { margin:6px 0; color:var(--muted); font-size:13px; }
+    label { display:block; font-size:12px; color:#b8bcc6; margin:8px 0 4px; } input { width:100%; background:#1d2027; border:1px solid var(--border); color:var(--text); border-radius:8px; padding:8px; }
+    button { margin-top:10px; background:var(--accent); color:#fff; border:none; border-radius:8px; padding:8px 12px; cursor:pointer; font-weight:600; }
+    .row { display:flex; gap:8px; } .row > * { flex:1; }
+    .out { margin-top:8px; font-size:13px; white-space:pre-wrap; }
+    .ok { color:var(--good); } .err { color:var(--bad); }
+  </style>
+</head>
+<body>
+  <header>
+    <span>Signed in as <strong>${name}</strong></span>
+    <span><a href="/">Home</a> · <a href="/archive">Archive</a> · <span class="bal" id="bal">Balance: ${Number(wallet || 0).toLocaleString()} coins</span> · <a href="/auth/logout">Log out</a></span>
+  </header>
+  <div class="wrap">
+    <div class="grid">
+      <div class="card">
+        <h2>Blackjack</h2>
+        <p>Start a hand, then hit or stand.</p>
+        <label>Bet</label><input id="bj-bet" type="number" min="1" value="100" />
+        <div class="row"><button id="bj-start">Start</button><button id="bj-hit">Hit</button><button id="bj-stand">Stand</button></div>
+        <div class="out" id="bj-out"></div>
+      </div>
+      <div class="card">
+        <h2>Crash</h2>
+        <p>Set auto cashout multiplier. Win if crash point reaches it.</p>
+        <label>Bet</label><input id="cr-bet" type="number" min="1" value="100" />
+        <label>Cashout multiplier</label><input id="cr-mult" type="number" min="1.01" step="0.01" value="1.8" />
+        <button id="cr-play">Play Crash</button>
+        <div class="out" id="cr-out"></div>
+      </div>
+      <div class="card">
+        <h2>Mines</h2>
+        <p>Set tiles, mines, and number of safe picks to attempt.</p>
+        <label>Bet</label><input id="mi-bet" type="number" min="1" value="100" />
+        <div class="row"><div><label>Tiles</label><input id="mi-tiles" type="number" min="5" max="30" value="25" /></div><div><label>Mines</label><input id="mi-mines" type="number" min="1" max="24" value="3" /></div></div>
+        <label>Safe picks</label><input id="mi-picks" type="number" min="1" value="2" />
+        <button id="mi-play">Play Mines</button>
+        <div class="out" id="mi-out"></div>
+      </div>
+    </div>
+  </div>
+  <script>
+    function fmt(n) { return Number(n || 0).toLocaleString(); }
+    function setBal(n) { document.getElementById("bal").textContent = "Balance: " + fmt(n) + " coins"; }
+    async function post(url, body) {
+      const r = await fetch(url, { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body || {}) });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || "Request failed");
+      return j;
+    }
+    document.getElementById("bj-start").onclick = async function () {
+      const out = document.getElementById("bj-out");
+      try {
+        const j = await post("/api/casino/blackjack/start", { bet: Number(document.getElementById("bj-bet").value || 0) });
+        setBal(j.wallet); out.className = "out";
+        out.textContent = j.done
+          ? ("Result: " + j.result + "\\nPlayer: " + (j.player||[]).join(" ") + " (" + j.playerTotal + ")\\nDealer: " + (j.dealer||[]).join(" ") + " (" + j.dealerTotal + ")\\nPayout: " + fmt(j.payout))
+          : ("Player: " + (j.player||[]).join(" ") + " (" + j.playerTotal + ")\\nDealer up: " + (j.dealerUp||[]).join(" "));
+      } catch (e) { out.className = "out err"; out.textContent = e.message; }
+    };
+    document.getElementById("bj-hit").onclick = async function () {
+      const out = document.getElementById("bj-out");
+      try {
+        const j = await post("/api/casino/blackjack/hit", {});
+        setBal(j.wallet); out.className = "out";
+        out.textContent = j.done
+          ? ("Result: " + j.result + "\\nPlayer: " + (j.player||[]).join(" ") + " (" + j.playerTotal + ")\\nDealer: " + (j.dealer||[]).join(" ") + " (" + j.dealerTotal + ")")
+          : ("Player: " + (j.player||[]).join(" ") + " (" + j.playerTotal + ")\\nDealer up: " + (j.dealerUp||[]).join(" "));
+      } catch (e) { out.className = "out err"; out.textContent = e.message; }
+    };
+    document.getElementById("bj-stand").onclick = async function () {
+      const out = document.getElementById("bj-out");
+      try {
+        const j = await post("/api/casino/blackjack/stand", {});
+        setBal(j.wallet); out.className = "out " + (j.result === "win" ? "ok" : "");
+        out.textContent = "Result: " + j.result + "\\nPlayer: " + (j.player||[]).join(" ") + " (" + j.playerTotal + ")\\nDealer: " + (j.dealer||[]).join(" ") + " (" + j.dealerTotal + ")\\nPayout: " + fmt(j.payout);
+      } catch (e) { out.className = "out err"; out.textContent = e.message; }
+    };
+    document.getElementById("cr-play").onclick = async function () {
+      const out = document.getElementById("cr-out");
+      try {
+        const j = await post("/api/casino/crash/play", {
+          bet: Number(document.getElementById("cr-bet").value || 0),
+          cashout: Number(document.getElementById("cr-mult").value || 0),
+        });
+        setBal(j.wallet); out.className = "out " + (j.win ? "ok" : "err");
+        out.textContent = "Crash point: x" + j.crashPoint + "\\nYour cashout: x" + j.cashout + "\\n" + (j.win ? "Win" : "Lost") + "\\nPayout: " + fmt(j.payout);
+      } catch (e) { out.className = "out err"; out.textContent = e.message; }
+    };
+    document.getElementById("mi-play").onclick = async function () {
+      const out = document.getElementById("mi-out");
+      try {
+        const j = await post("/api/casino/mines/play", {
+          bet: Number(document.getElementById("mi-bet").value || 0),
+          tiles: Number(document.getElementById("mi-tiles").value || 25),
+          mines: Number(document.getElementById("mi-mines").value || 3),
+          picks: Number(document.getElementById("mi-picks").value || 1),
+        });
+        setBal(j.wallet); out.className = "out " + (j.win ? "ok" : "err");
+        out.textContent = (j.win ? "Safe!" : "Boom!") + "\\nTiles: " + j.tiles + ", Mines: " + j.mines + ", Picks: " + j.picks + "\\nMultiplier: x" + j.multiplier + "\\nPayout: " + fmt(j.payout);
+      } catch (e) { out.className = "out err"; out.textContent = e.message; }
+    };
   </script>
 </body>
 </html>`;

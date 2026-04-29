@@ -118,6 +118,39 @@ function getAgeRoleId(ageChoice) {
   return String(process.env[`AGE_ROLE_ID_${raw}`] || "").trim();
 }
 
+async function fetchGuildRoles() {
+  const guildId = DISCORD_GUILD_ID ? String(DISCORD_GUILD_ID).trim() : "";
+  if (!guildId) return [];
+  try {
+    const resp = await fetch(`${DISCORD_API}/guilds/${guildId}/roles`, {
+      headers: { Authorization: `Bot ${BOT_TOKEN}` },
+    });
+    if (!resp.ok) return [];
+    const data = await resp.json();
+    return Array.isArray(data) ? data : [];
+  } catch {
+    return [];
+  }
+}
+
+async function resolveAgeRoleId(ageChoice) {
+  const configured = getAgeRoleId(ageChoice);
+  if (configured) return configured;
+  const target = String(ageChoice || "").trim().toLowerCase();
+  const roles = await fetchGuildRoles();
+  const exact = roles.find((r) => String(r?.name || "").trim().toLowerCase() === target);
+  return exact?.id ? String(exact.id) : "";
+}
+
+async function resolveGenderRoleId(genderChoice) {
+  const g = String(genderChoice || "").toLowerCase();
+  const configured = g === "male" ? MALE_ROLE_ID : FEMALE_ROLE_ID;
+  if (configured) return configured;
+  const roles = await fetchGuildRoles();
+  const exact = roles.find((r) => String(r?.name || "").trim().toLowerCase() === g);
+  return exact?.id ? String(exact.id) : "";
+}
+
 /** Built from CLIENT_ID + REDIRECT_URI so the button never disagrees with /callback token exchange. */
 function buildDiscordAuthorizeUrl() {
   const params = new URLSearchParams({
@@ -341,11 +374,15 @@ async function assignGenderAndAgeRoles(userId, genderChoice, ageChoice) {
     throw new Error("Invalid age choice.");
   }
 
-  const genderRole = gender === "male" ? MALE_ROLE_ID : FEMALE_ROLE_ID;
-  const oppositeGenderRole = gender === "male" ? FEMALE_ROLE_ID : MALE_ROLE_ID;
-  const ageRole = getAgeRoleId(age);
+  const genderRole = await resolveGenderRoleId(gender);
+  const oppositeGenderRole = await resolveGenderRoleId(gender === "male" ? "female" : "male");
+  const ageRole = await resolveAgeRoleId(age);
 
-  await removeRoleFromMember(userId, oppositeGenderRole);
+  if (!genderRole) {
+    throw new Error(`Gender role for '${gender}' is not configured/found.`);
+  }
+
+  if (oppositeGenderRole) await removeRoleFromMember(userId, oppositeGenderRole);
   const genderOk = await addRoleToMember(userId, genderRole);
   if (!genderOk) {
     throw new Error("Could not assign your gender role. Ensure bot role is above target roles and has Manage Roles.");
