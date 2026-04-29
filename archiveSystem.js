@@ -159,12 +159,10 @@ function economyKey(guildId, userId) {
 
 function resolveEconomyKey(data, guildId, userId) {
   const preferred = economyKey(guildId, userId);
+  if (data && Object.prototype.hasOwnProperty.call(data, preferred)) return preferred;
   const suffix = `:${userId}`;
   const keys = Object.keys(data || {}).filter((k) => k.endsWith(suffix));
-  // Server/Discord balance is authoritative: prefer any existing user key first,
-  // instead of forcing the website's preferred guild key.
-  if (keys.length > 0) return keys[0];
-  if (data && Object.prototype.hasOwnProperty.call(data, preferred)) return preferred;
+  if (keys.length === 1) return keys[0];
   return preferred;
 }
 
@@ -689,9 +687,11 @@ function attachArchiveSystem(deps) {
     BUNNY_STORAGE_ENDPOINT,
     BUNNY_STORAGE_ACCESS_KEY,
     BUNNY_CDN_BASE,
+    ECONOMY_GUILD_ID,
   } = deps;
 
   const authRedirect = SITE_AUTH_REDIRECT_URI;
+  const casinoGuildId = String(ECONOMY_GUILD_ID || ARCHIVE_GUILD_ID || "").trim();
   const mediaChannelId = String(SPECIAL_MEDIA_CHANNEL_ID || "").trim();
   const mediaBackupCfg = {
     enabled: MEDIA_BACKUP_ENABLED !== false,
@@ -789,25 +789,26 @@ function attachArchiveSystem(deps) {
 
   app.get("/casino/blackjack", requireArchiveMember, async (req, res) => {
     const u = req.session.archiveUser;
-    const wallet = await readWallet(ARCHIVE_GUILD_ID, u.id);
+    const wallet = await readWallet(casinoGuildId, u.id);
     res.type("html").send(casinoGameHtml(SITE_BASE, u, wallet ?? 0, "blackjack"));
   });
 
   app.get("/casino/crash", requireArchiveMember, async (req, res) => {
     const u = req.session.archiveUser;
-    const wallet = await readWallet(ARCHIVE_GUILD_ID, u.id);
+    const wallet = await readWallet(casinoGuildId, u.id);
     res.type("html").send(casinoGameHtml(SITE_BASE, u, wallet ?? 0, "crash"));
   });
 
   app.get("/casino/mines", requireArchiveMember, async (req, res) => {
     const u = req.session.archiveUser;
-    const wallet = await readWallet(ARCHIVE_GUILD_ID, u.id);
+    const wallet = await readWallet(casinoGuildId, u.id);
     res.type("html").send(casinoGameHtml(SITE_BASE, u, wallet ?? 0, "mines"));
   });
 
   app.get("/api/casino/balance", requireArchiveMember, async (req, res) => {
     const u = req.session.archiveUser;
-    const wallet = await readWallet(ARCHIVE_GUILD_ID, u.id);
+    const wallet = await readWallet(casinoGuildId, u.id);
+    res.setHeader("Cache-Control", "no-store");
     if (wallet == null) return res.status(404).json({ error: "No server balance profile found yet. Use economy command in Discord first." });
     res.json({ wallet });
   });
@@ -815,10 +816,10 @@ function attachArchiveSystem(deps) {
   app.post("/api/casino/blackjack/start", requireArchiveMember, async (req, res) => {
     const u = req.session.archiveUser;
     const bet = Math.max(1, parseInt(req.body?.bet || "0", 10) || 0);
-    const wallet = await readWallet(ARCHIVE_GUILD_ID, u.id);
+    const wallet = await readWallet(casinoGuildId, u.id);
     if (wallet == null) return res.status(400).json({ error: "No server balance profile found yet. Use 6bal once in server." });
     if (bet <= 0 || bet > wallet) return res.status(400).json({ error: "Invalid bet amount." });
-    const walletAfterBet = await adjustWallet(ARCHIVE_GUILD_ID, u.id, -bet);
+    const walletAfterBet = await adjustWallet(casinoGuildId, u.id, -bet);
     if (walletAfterBet == null) return res.status(400).json({ error: "Could not use server balance profile." });
     const deck = cardDeck();
     const player = [deck.pop(), deck.pop()];
@@ -829,7 +830,7 @@ function attachArchiveSystem(deps) {
     const p = handTotal(player);
     if (p === 21) {
       const payout = Math.floor(bet * 2.5);
-      const walletNow = await adjustWallet(ARCHIVE_GUILD_ID, u.id, payout);
+      const walletNow = await adjustWallet(casinoGuildId, u.id, payout);
       if (walletNow == null) return res.status(400).json({ error: "Could not update server balance profile." });
       req.session.casino.bj = null;
       return res.json({ done: true, result: "blackjack", payout, wallet: walletNow, player, dealer, playerTotal: p, dealerTotal: handTotal(dealer) });
@@ -846,12 +847,12 @@ function attachArchiveSystem(deps) {
     if (p > 21) {
       state.done = true;
       req.session.casino.bj = null;
-      const wallet = await readWallet(ARCHIVE_GUILD_ID, u.id);
+      const wallet = await readWallet(casinoGuildId, u.id);
       if (wallet == null) return res.status(400).json({ error: "No server balance profile found yet." });
       return res.json({ done: true, result: "bust", payout: 0, wallet, player: state.player, dealer: state.dealer, playerTotal: p, dealerTotal: handTotal(state.dealer) });
     }
     req.session.casino.bj = state;
-    const wallet = await readWallet(ARCHIVE_GUILD_ID, u.id);
+    const wallet = await readWallet(casinoGuildId, u.id);
     if (wallet == null) return res.status(400).json({ error: "No server balance profile found yet." });
     res.json({ done: false, wallet, player: state.player, dealerUp: [state.dealer[0]], playerTotal: p });
   });
@@ -872,7 +873,7 @@ function attachArchiveSystem(deps) {
       result = "push";
       payout = state.bet;
     }
-    const wallet = payout > 0 ? await adjustWallet(ARCHIVE_GUILD_ID, u.id, payout) : await readWallet(ARCHIVE_GUILD_ID, u.id);
+    const wallet = payout > 0 ? await adjustWallet(casinoGuildId, u.id, payout) : await readWallet(casinoGuildId, u.id);
     if (wallet == null) return res.status(400).json({ error: "Could not update server balance profile." });
     req.session.casino.bj = null;
     res.json({ done: true, result, payout, wallet, player: state.player, dealer: state.dealer, playerTotal: p, dealerTotal: d });
@@ -882,16 +883,16 @@ function attachArchiveSystem(deps) {
     const u = req.session.archiveUser;
     const bet = Math.max(1, parseInt(req.body?.bet || "0", 10) || 0);
     const cashout = Math.max(1.01, Number(req.body?.cashout || 1.5));
-    const wallet = await readWallet(ARCHIVE_GUILD_ID, u.id);
+    const wallet = await readWallet(casinoGuildId, u.id);
     if (wallet == null) return res.status(400).json({ error: "No server balance profile found yet. Use 6bal once in server." });
     if (bet <= 0 || bet > wallet) return res.status(400).json({ error: "Invalid bet amount." });
-    const afterBet = await adjustWallet(ARCHIVE_GUILD_ID, u.id, -bet);
+    const afterBet = await adjustWallet(casinoGuildId, u.id, -bet);
     if (afterBet == null) return res.status(400).json({ error: "Could not use server balance profile." });
     const roll = Math.random();
     const crashPoint = Math.max(1.0, Number((1 + (roll * 9.5)).toFixed(2)));
     const win = cashout <= crashPoint;
     const payout = win ? Math.floor(bet * cashout) : 0;
-    const walletNow = payout > 0 ? await adjustWallet(ARCHIVE_GUILD_ID, u.id, payout) : await readWallet(ARCHIVE_GUILD_ID, u.id);
+    const walletNow = payout > 0 ? await adjustWallet(casinoGuildId, u.id, payout) : await readWallet(casinoGuildId, u.id);
     if (walletNow == null) return res.status(400).json({ error: "Could not update server balance profile." });
     res.json({ crashPoint, cashout, win, payout, wallet: walletNow });
   });
@@ -904,10 +905,10 @@ function attachArchiveSystem(deps) {
     const maxPicks = Math.max(1, tiles - mines);
     const picks = Math.max(1, Math.min(maxPicks, parseInt(req.body?.picks || "1", 10) || 1));
     if (mines >= tiles) return res.status(400).json({ error: "Mines must be less than tiles." });
-    const wallet = await readWallet(ARCHIVE_GUILD_ID, u.id);
+    const wallet = await readWallet(casinoGuildId, u.id);
     if (wallet == null) return res.status(400).json({ error: "No server balance profile found yet. Use 6bal once in server." });
     if (bet <= 0 || bet > wallet) return res.status(400).json({ error: "Invalid bet amount." });
-    const afterBet = await adjustWallet(ARCHIVE_GUILD_ID, u.id, -bet);
+    const afterBet = await adjustWallet(casinoGuildId, u.id, -bet);
     if (afterBet == null) return res.status(400).json({ error: "Could not use server balance profile." });
 
     const pool = [...Array(tiles).keys()];
@@ -931,7 +932,7 @@ function attachArchiveSystem(deps) {
       mult *= 0.96;
     }
     const payout = hitMine ? 0 : Math.floor(bet * mult);
-    const walletNow = payout > 0 ? await adjustWallet(ARCHIVE_GUILD_ID, u.id, payout) : await readWallet(ARCHIVE_GUILD_ID, u.id);
+    const walletNow = payout > 0 ? await adjustWallet(casinoGuildId, u.id, payout) : await readWallet(casinoGuildId, u.id);
     if (walletNow == null) return res.status(400).json({ error: "Could not update server balance profile." });
     res.json({
       win: !hitMine,
@@ -950,10 +951,10 @@ function attachArchiveSystem(deps) {
     const tiles = Math.max(5, Math.min(25, parseInt(req.body?.tiles || "25", 10) || 25));
     const mines = Math.max(1, Math.min(24, parseInt(req.body?.mines || "3", 10) || 3));
     if (mines >= tiles) return res.status(400).json({ error: "Mines must be less than tiles." });
-    const wallet = await readWallet(ARCHIVE_GUILD_ID, u.id);
+    const wallet = await readWallet(casinoGuildId, u.id);
     if (wallet == null) return res.status(400).json({ error: "No server balance profile found yet. Use 6bal once in server." });
     if (bet <= 0 || bet > wallet) return res.status(400).json({ error: "Invalid bet amount." });
-    const walletAfterBet = await adjustWallet(ARCHIVE_GUILD_ID, u.id, -bet);
+    const walletAfterBet = await adjustWallet(casinoGuildId, u.id, -bet);
     if (walletAfterBet == null) return res.status(400).json({ error: "Could not use server balance profile." });
 
     const pool = [...Array(tiles).keys()];
@@ -985,7 +986,7 @@ function attachArchiveSystem(deps) {
     if (game.mineTiles.includes(tile)) {
       game.done = true;
       req.session.casino.mines = null;
-      const walletNow = await readWallet(ARCHIVE_GUILD_ID, u.id);
+      const walletNow = await readWallet(casinoGuildId, u.id);
       if (walletNow == null) return res.status(400).json({ error: "No server balance profile found yet." });
       return res.json({ done: true, hit_mine: true, tile, wallet: walletNow, picked: [...game.picked], reveal_mines: game.mineTiles });
     }
@@ -994,7 +995,7 @@ function attachArchiveSystem(deps) {
     const mult = minesMultiplier(game.tiles, game.mines, game.picked.length);
     const potential = Math.floor(game.bet * mult);
     req.session.casino.mines = game;
-    const walletNow = await readWallet(ARCHIVE_GUILD_ID, u.id);
+    const walletNow = await readWallet(casinoGuildId, u.id);
     if (walletNow == null) return res.status(400).json({ error: "No server balance profile found yet." });
     res.json({
       done: false,
@@ -1014,7 +1015,7 @@ function attachArchiveSystem(deps) {
     if (!game.picked.length) return res.status(400).json({ error: "Pick at least one tile first." });
     const mult = minesMultiplier(game.tiles, game.mines, game.picked.length);
     const payout = Math.floor(game.bet * mult);
-    const walletNow = await adjustWallet(ARCHIVE_GUILD_ID, u.id, payout);
+    const walletNow = await adjustWallet(casinoGuildId, u.id, payout);
     if (walletNow == null) return res.status(400).json({ error: "Could not update server balance profile." });
     req.session.casino.mines = null;
     res.json({
@@ -1475,11 +1476,15 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
     const stats = document.getElementById("stats");
     const sentinel = document.getElementById("sentinel");
     const sentinelMsg = document.getElementById("sentinel-msg");
-    fetch("/api/casino/balance").then((r) => (r.ok ? r.json() : null)).then((j) => {
-      if (!j) return;
-      var b = Number(j.wallet || 0);
-      document.getElementById("top-balance").textContent = "Balance: " + b.toLocaleString() + " coins";
-    }).catch(() => {});
+    function refreshTopBalance() {
+      fetch("/api/casino/balance", { cache: "no-store" }).then((r) => (r.ok ? r.json() : null)).then((j) => {
+        if (!j) return;
+        var b = Number(j.wallet || 0);
+        document.getElementById("top-balance").textContent = "Balance: " + b.toLocaleString() + " coins";
+      }).catch(() => {});
+    }
+    refreshTopBalance();
+    setInterval(refreshTopBalance, 10000);
 
     CHANNEL_IDS.forEach((id) => {
       const b = document.createElement("button");
@@ -2153,6 +2158,14 @@ function casinoGameHtml(siteBase, user, wallet, game) {
   <script>
     function fmt(n) { return Number(n || 0).toLocaleString(); }
     function setBal(n) { document.getElementById("bal").textContent = "Balance: " + fmt(n) + " coins"; }
+    function refreshBalance() {
+      fetch("/api/casino/balance", { cache: "no-store" })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (j) { if (j) setBal(j.wallet); })
+        .catch(function () {});
+    }
+    refreshBalance();
+    setInterval(refreshBalance, 7000);
     async function post(url, body) {
       const r = await fetch(url, { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body || {}) });
       const j = await r.json().catch(() => ({}));

@@ -102,6 +102,7 @@ const MEDIA_BACKUP_MAX_BYTES = Math.max(
 const BUNNY_STORAGE_ENDPOINT = String(process.env.BUNNY_STORAGE_ENDPOINT || "").trim();
 const BUNNY_STORAGE_ACCESS_KEY = String(process.env.BUNNY_STORAGE_ACCESS_KEY || "").trim();
 const BUNNY_CDN_BASE = String(process.env.BUNNY_CDN_BASE || "").trim();
+const ECONOMY_GUILD_ID = String(process.env.ECONOMY_GUILD_ID || DISCORD_GUILD_ID || "").trim();
 
 function safeSiteHostname() {
   try {
@@ -1317,6 +1318,7 @@ attachArchiveSystem({
   BUNNY_STORAGE_ENDPOINT,
   BUNNY_STORAGE_ACCESS_KEY,
   BUNNY_CDN_BASE,
+  ECONOMY_GUILD_ID,
 });
 
 function formatRemainingMs(ms) {
