@@ -157,6 +157,15 @@ function economyKey(guildId, userId) {
   return `${guildId}:${userId}`;
 }
 
+function resolveEconomyKey(data, guildId, userId) {
+  const preferred = economyKey(guildId, userId);
+  if (data && Object.prototype.hasOwnProperty.call(data, preferred)) return preferred;
+  const suffix = `:${userId}`;
+  const keys = Object.keys(data || {}).filter((k) => k.endsWith(suffix));
+  if (keys.length > 0) return keys[0];
+  return preferred;
+}
+
 function getWalletFromEntry(entry) {
   return Math.max(0, parseInt(entry?.wallet || START_WALLET, 10) || START_WALLET);
 }
@@ -164,7 +173,7 @@ function getWalletFromEntry(entry) {
 async function adjustWallet(guildId, userId, delta) {
   return withEconomyLock(async () => {
     const all = await readEconomyData();
-    const key = economyKey(guildId, userId);
+    const key = resolveEconomyKey(all, guildId, userId);
     const cur = all[key] && typeof all[key] === "object" ? all[key] : { wallet: START_WALLET, bank: 0 };
     const next = Math.max(0, getWalletFromEntry(cur) + delta);
     all[key] = { ...cur, wallet: next };
@@ -175,7 +184,7 @@ async function adjustWallet(guildId, userId, delta) {
 
 async function readWallet(guildId, userId) {
   const all = await readEconomyData();
-  const key = economyKey(guildId, userId);
+  const key = resolveEconomyKey(all, guildId, userId);
   const cur = all[key] && typeof all[key] === "object" ? all[key] : { wallet: START_WALLET, bank: 0 };
   return getWalletFromEntry(cur);
 }
@@ -758,9 +767,25 @@ function attachArchiveSystem(deps) {
   });
 
   app.get("/casino", requireArchiveMember, async (req, res) => {
+    res.redirect(302, "/casino/blackjack");
+  });
+
+  app.get("/casino/blackjack", requireArchiveMember, async (req, res) => {
     const u = req.session.archiveUser;
     const wallet = await readWallet(ARCHIVE_GUILD_ID, u.id);
-    res.type("html").send(casinoHtml(SITE_BASE, u, wallet));
+    res.type("html").send(casinoGameHtml(SITE_BASE, u, wallet, "blackjack"));
+  });
+
+  app.get("/casino/crash", requireArchiveMember, async (req, res) => {
+    const u = req.session.archiveUser;
+    const wallet = await readWallet(ARCHIVE_GUILD_ID, u.id);
+    res.type("html").send(casinoGameHtml(SITE_BASE, u, wallet, "crash"));
+  });
+
+  app.get("/casino/mines", requireArchiveMember, async (req, res) => {
+    const u = req.session.archiveUser;
+    const wallet = await readWallet(ARCHIVE_GUILD_ID, u.id);
+    res.type("html").send(casinoGameHtml(SITE_BASE, u, wallet, "mines"));
   });
 
   app.get("/api/casino/balance", requireArchiveMember, async (req, res) => {
@@ -1941,8 +1966,9 @@ function archivePostHtml(siteBase, user, channelId, messageId, channelTitle) {
 </html>`;
 }
 
-function casinoHtml(siteBase, user, wallet) {
+function casinoGameHtml(siteBase, user, wallet, game) {
   const name = escapeHtml(user.global_name || user.username || "member");
+  const current = ["blackjack", "crash", "mines"].includes(game) ? game : "blackjack";
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1953,15 +1979,23 @@ function casinoHtml(siteBase, user, wallet) {
     :root { --bg:#0c0d10; --panel:#14161c; --border:#252830; --text:#e8eaed; --muted:#9aa0a6; --accent:#5865f2; --good:#3ba55d; --bad:#ed4245; }
     * { box-sizing:border-box; } body { margin:0; font-family:system-ui,sans-serif; background:var(--bg); color:var(--text); }
     header { padding:14px 18px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; flex-wrap:wrap; gap:8px; }
-    header a { color:#8ea1ff; } .wrap { max-width:1100px; margin:0 auto; padding:16px; }
-    .bal { color:#d3f9d8; } .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:12px; }
+    header a { color:#8ea1ff; } .wrap { max-width:900px; margin:0 auto; padding:16px; }
+    .bal { color:#d3f9d8; } .nav { display:flex; gap:8px; margin-bottom:12px; }
+    .nav a { padding:8px 12px; border-radius:8px; border:1px solid var(--border); text-decoration:none; color:var(--text); background:#1b1e24; }
+    .nav a.active { border-color:var(--accent); color:#c7d2fe; }
     .card { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:14px; }
     h2 { margin:0 0 8px; font-size:1.05rem; } p { margin:6px 0; color:var(--muted); font-size:13px; }
     label { display:block; font-size:12px; color:#b8bcc6; margin:8px 0 4px; } input { width:100%; background:#1d2027; border:1px solid var(--border); color:var(--text); border-radius:8px; padding:8px; }
     button { margin-top:10px; background:var(--accent); color:#fff; border:none; border-radius:8px; padding:8px 12px; cursor:pointer; font-weight:600; }
-    .row { display:flex; gap:8px; } .row > * { flex:1; }
-    .out { margin-top:8px; font-size:13px; white-space:pre-wrap; }
+    .row { display:flex; gap:8px; } .row > * { flex:1; } .out { margin-top:8px; font-size:13px; white-space:pre-wrap; }
     .ok { color:var(--good); } .err { color:var(--bad); }
+    .viz { margin-top:10px; border:1px solid var(--border); border-radius:10px; background:#0f1217; padding:12px; min-height:120px; }
+    .crash-meter { font-size:28px; font-weight:700; letter-spacing:0.02em; }
+    .crash-bar { height:10px; background:#1d2230; border-radius:999px; overflow:hidden; margin-top:8px; }
+    .crash-fill { height:100%; width:0%; background:linear-gradient(90deg,#5865f2,#7c9cff); transition:width .12s linear; }
+    .mines-grid { display:grid; grid-template-columns:repeat(5,1fr); gap:6px; }
+    .tile { border:1px solid var(--border); border-radius:8px; height:36px; display:flex; align-items:center; justify-content:center; background:#1a1f2a; font-size:12px; color:#aab0bc; }
+    .tile.safe { background:#1f3a2a; color:#d1fadf; border-color:#2f6e4c; }
   </style>
 </head>
 <body>
@@ -1970,31 +2004,36 @@ function casinoHtml(siteBase, user, wallet) {
     <span><a href="/">Home</a> · <a href="/archive">Archive</a> · <span class="bal" id="bal">Balance: ${Number(wallet || 0).toLocaleString()} coins</span> · <a href="/auth/logout">Log out</a></span>
   </header>
   <div class="wrap">
-    <div class="grid">
-      <div class="card">
-        <h2>Blackjack</h2>
-        <p>Start a hand, then hit or stand.</p>
-        <label>Bet</label><input id="bj-bet" type="number" min="1" value="100" />
-        <div class="row"><button id="bj-start">Start</button><button id="bj-hit">Hit</button><button id="bj-stand">Stand</button></div>
-        <div class="out" id="bj-out"></div>
-      </div>
-      <div class="card">
-        <h2>Crash</h2>
-        <p>Set auto cashout multiplier. Win if crash point reaches it.</p>
-        <label>Bet</label><input id="cr-bet" type="number" min="1" value="100" />
-        <label>Cashout multiplier</label><input id="cr-mult" type="number" min="1.01" step="0.01" value="1.8" />
-        <button id="cr-play">Play Crash</button>
-        <div class="out" id="cr-out"></div>
-      </div>
-      <div class="card">
-        <h2>Mines</h2>
-        <p>Set tiles, mines, and number of safe picks to attempt.</p>
-        <label>Bet</label><input id="mi-bet" type="number" min="1" value="100" />
-        <div class="row"><div><label>Tiles</label><input id="mi-tiles" type="number" min="5" max="30" value="25" /></div><div><label>Mines</label><input id="mi-mines" type="number" min="1" max="24" value="3" /></div></div>
-        <label>Safe picks</label><input id="mi-picks" type="number" min="1" value="2" />
-        <button id="mi-play">Play Mines</button>
-        <div class="out" id="mi-out"></div>
-      </div>
+    <div class="nav">
+      <a href="/casino/blackjack" class="${current === "blackjack" ? "active" : ""}">Blackjack</a>
+      <a href="/casino/crash" class="${current === "crash" ? "active" : ""}">Crash</a>
+      <a href="/casino/mines" class="${current === "mines" ? "active" : ""}">Mines</a>
+    </div>
+    <div class="card">
+      ${current === "blackjack" ? `
+      <h2>Blackjack</h2>
+      <p>Start a hand, then hit or stand.</p>
+      <label>Bet</label><input id="bj-bet" type="number" min="1" value="100" />
+      <div class="row"><button id="bj-start">Start</button><button id="bj-hit">Hit</button><button id="bj-stand">Stand</button></div>
+      <div class="viz" id="bj-viz">No active hand.</div>
+      <div class="out" id="bj-out"></div>` : ""}
+      ${current === "crash" ? `
+      <h2>Crash</h2>
+      <p>Set auto cashout multiplier. Win if crash point reaches it.</p>
+      <label>Bet</label><input id="cr-bet" type="number" min="1" value="100" />
+      <label>Cashout multiplier</label><input id="cr-mult" type="number" min="1.01" step="0.01" value="1.8" />
+      <button id="cr-play">Play Crash</button>
+      <div class="viz"><div class="crash-meter" id="cr-meter">x1.00</div><div class="crash-bar"><div class="crash-fill" id="cr-fill"></div></div></div>
+      <div class="out" id="cr-out"></div>` : ""}
+      ${current === "mines" ? `
+      <h2>Mines</h2>
+      <p>Set tiles/mines/picks and see revealed safe picks.</p>
+      <label>Bet</label><input id="mi-bet" type="number" min="1" value="100" />
+      <div class="row"><div><label>Tiles</label><input id="mi-tiles" type="number" min="5" max="25" value="25" /></div><div><label>Mines</label><input id="mi-mines" type="number" min="1" max="24" value="3" /></div></div>
+      <label>Safe picks</label><input id="mi-picks" type="number" min="1" value="2" />
+      <button id="mi-play">Play Mines</button>
+      <div class="viz"><div class="mines-grid" id="mi-grid"></div></div>
+      <div class="out" id="mi-out"></div>` : ""}
     </div>
   </div>
   <script>
@@ -2006,58 +2045,93 @@ function casinoHtml(siteBase, user, wallet) {
       if (!r.ok) throw new Error(j.error || "Request failed");
       return j;
     }
-    document.getElementById("bj-start").onclick = async function () {
-      const out = document.getElementById("bj-out");
-      try {
-        const j = await post("/api/casino/blackjack/start", { bet: Number(document.getElementById("bj-bet").value || 0) });
-        setBal(j.wallet); out.className = "out";
-        out.textContent = j.done
-          ? ("Result: " + j.result + "\\nPlayer: " + (j.player||[]).join(" ") + " (" + j.playerTotal + ")\\nDealer: " + (j.dealer||[]).join(" ") + " (" + j.dealerTotal + ")\\nPayout: " + fmt(j.payout))
-          : ("Player: " + (j.player||[]).join(" ") + " (" + j.playerTotal + ")\\nDealer up: " + (j.dealerUp||[]).join(" "));
-      } catch (e) { out.className = "out err"; out.textContent = e.message; }
-    };
-    document.getElementById("bj-hit").onclick = async function () {
-      const out = document.getElementById("bj-out");
-      try {
-        const j = await post("/api/casino/blackjack/hit", {});
-        setBal(j.wallet); out.className = "out";
-        out.textContent = j.done
-          ? ("Result: " + j.result + "\\nPlayer: " + (j.player||[]).join(" ") + " (" + j.playerTotal + ")\\nDealer: " + (j.dealer||[]).join(" ") + " (" + j.dealerTotal + ")")
-          : ("Player: " + (j.player||[]).join(" ") + " (" + j.playerTotal + ")\\nDealer up: " + (j.dealerUp||[]).join(" "));
-      } catch (e) { out.className = "out err"; out.textContent = e.message; }
-    };
-    document.getElementById("bj-stand").onclick = async function () {
-      const out = document.getElementById("bj-out");
-      try {
-        const j = await post("/api/casino/blackjack/stand", {});
-        setBal(j.wallet); out.className = "out " + (j.result === "win" ? "ok" : "");
-        out.textContent = "Result: " + j.result + "\\nPlayer: " + (j.player||[]).join(" ") + " (" + j.playerTotal + ")\\nDealer: " + (j.dealer||[]).join(" ") + " (" + j.dealerTotal + ")\\nPayout: " + fmt(j.payout);
-      } catch (e) { out.className = "out err"; out.textContent = e.message; }
-    };
-    document.getElementById("cr-play").onclick = async function () {
-      const out = document.getElementById("cr-out");
-      try {
-        const j = await post("/api/casino/crash/play", {
-          bet: Number(document.getElementById("cr-bet").value || 0),
-          cashout: Number(document.getElementById("cr-mult").value || 0),
-        });
-        setBal(j.wallet); out.className = "out " + (j.win ? "ok" : "err");
-        out.textContent = "Crash point: x" + j.crashPoint + "\\nYour cashout: x" + j.cashout + "\\n" + (j.win ? "Win" : "Lost") + "\\nPayout: " + fmt(j.payout);
-      } catch (e) { out.className = "out err"; out.textContent = e.message; }
-    };
-    document.getElementById("mi-play").onclick = async function () {
-      const out = document.getElementById("mi-out");
-      try {
-        const j = await post("/api/casino/mines/play", {
-          bet: Number(document.getElementById("mi-bet").value || 0),
-          tiles: Number(document.getElementById("mi-tiles").value || 25),
-          mines: Number(document.getElementById("mi-mines").value || 3),
-          picks: Number(document.getElementById("mi-picks").value || 1),
-        });
-        setBal(j.wallet); out.className = "out " + (j.win ? "ok" : "err");
-        out.textContent = (j.win ? "Safe!" : "Boom!") + "\\nTiles: " + j.tiles + ", Mines: " + j.mines + ", Picks: " + j.picks + "\\nMultiplier: x" + j.multiplier + "\\nPayout: " + fmt(j.payout);
-      } catch (e) { out.className = "out err"; out.textContent = e.message; }
-    };
+    const game = ${JSON.stringify(current)};
+    if (game === "blackjack") {
+      document.getElementById("bj-start").onclick = async function () {
+        const out = document.getElementById("bj-out"), viz = document.getElementById("bj-viz");
+        try {
+          const j = await post("/api/casino/blackjack/start", { bet: Number(document.getElementById("bj-bet").value || 0) });
+          setBal(j.wallet); out.className = "out";
+          if (j.done) {
+            out.textContent = "Result: " + j.result + "\\nPayout: " + fmt(j.payout);
+            viz.textContent = "Player: " + (j.player||[]).join(" ") + " (" + j.playerTotal + ") | Dealer: " + (j.dealer||[]).join(" ") + " (" + j.dealerTotal + ")";
+          } else {
+            out.textContent = "Hand started.";
+            viz.textContent = "Player: " + (j.player||[]).join(" ") + " (" + j.playerTotal + ") | Dealer up: " + (j.dealerUp||[]).join(" ");
+          }
+        } catch (e) { out.className = "out err"; out.textContent = e.message; }
+      };
+      document.getElementById("bj-hit").onclick = async function () {
+        const out = document.getElementById("bj-out"), viz = document.getElementById("bj-viz");
+        try {
+          const j = await post("/api/casino/blackjack/hit", {});
+          setBal(j.wallet); out.className = "out";
+          out.textContent = j.done ? ("Result: " + j.result) : "Hit.";
+          viz.textContent = j.done
+            ? ("Player: " + (j.player||[]).join(" ") + " (" + j.playerTotal + ") | Dealer: " + (j.dealer||[]).join(" ") + " (" + j.dealerTotal + ")")
+            : ("Player: " + (j.player||[]).join(" ") + " (" + j.playerTotal + ") | Dealer up: " + (j.dealerUp||[]).join(" "));
+        } catch (e) { out.className = "out err"; out.textContent = e.message; }
+      };
+      document.getElementById("bj-stand").onclick = async function () {
+        const out = document.getElementById("bj-out"), viz = document.getElementById("bj-viz");
+        try {
+          const j = await post("/api/casino/blackjack/stand", {});
+          setBal(j.wallet); out.className = "out " + (j.result === "win" ? "ok" : "");
+          out.textContent = "Result: " + j.result + "\\nPayout: " + fmt(j.payout);
+          viz.textContent = "Player: " + (j.player||[]).join(" ") + " (" + j.playerTotal + ") | Dealer: " + (j.dealer||[]).join(" ") + " (" + j.dealerTotal + ")";
+        } catch (e) { out.className = "out err"; out.textContent = e.message; }
+      };
+    } else if (game === "crash") {
+      document.getElementById("cr-play").onclick = async function () {
+        const out = document.getElementById("cr-out");
+        const meter = document.getElementById("cr-meter"), fill = document.getElementById("cr-fill");
+        try {
+          const j = await post("/api/casino/crash/play", {
+            bet: Number(document.getElementById("cr-bet").value || 0),
+            cashout: Number(document.getElementById("cr-mult").value || 0),
+          });
+          setBal(j.wallet); out.className = "out " + (j.win ? "ok" : "err");
+          let x = 1.0;
+          const target = Math.max(1, Number(j.crashPoint || 1));
+          meter.textContent = "x1.00"; fill.style.width = "0%";
+          const timer = setInterval(() => {
+            x = Math.min(target, Number((x + 0.07).toFixed(2)));
+            meter.textContent = "x" + x.toFixed(2);
+            fill.style.width = Math.min(100, ((x - 1) / Math.max(0.01, target - 1)) * 100) + "%";
+            if (x >= target) {
+              clearInterval(timer);
+              out.textContent = "Crash at x" + j.crashPoint + " · cashout x" + j.cashout + " · " + (j.win ? "WIN" : "LOSE") + " · payout " + fmt(j.payout);
+            }
+          }, 60);
+        } catch (e) { out.className = "out err"; out.textContent = e.message; }
+      };
+    } else if (game === "mines") {
+      function drawGrid(tiles, safeCount) {
+        var g = document.getElementById("mi-grid"); g.innerHTML = "";
+        for (var i = 0; i < tiles; i++) {
+          var d = document.createElement("div");
+          d.className = "tile" + (i < safeCount ? " safe" : "");
+          d.textContent = i + 1;
+          g.appendChild(d);
+        }
+      }
+      drawGrid(25, 0);
+      document.getElementById("mi-play").onclick = async function () {
+        const out = document.getElementById("mi-out");
+        try {
+          const j = await post("/api/casino/mines/play", {
+            bet: Number(document.getElementById("mi-bet").value || 0),
+            tiles: Number(document.getElementById("mi-tiles").value || 25),
+            mines: Number(document.getElementById("mi-mines").value || 3),
+            picks: Number(document.getElementById("mi-picks").value || 1),
+          });
+          setBal(j.wallet);
+          drawGrid(j.tiles, j.win ? j.picks : Math.max(0, j.picks - 1));
+          out.className = "out " + (j.win ? "ok" : "err");
+          out.textContent = (j.win ? "Safe picks hit." : "Hit a mine.") + " Multiplier x" + j.multiplier + " · payout " + fmt(j.payout);
+        } catch (e) { out.className = "out err"; out.textContent = e.message; }
+      };
+    }
   </script>
 </body>
 </html>`;
