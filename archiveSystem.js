@@ -890,6 +890,15 @@ function attachArchiveSystem(deps) {
     if (economySupabase) {
       out.sourcesTried.push("supabase");
       try {
+        const cnt = await economySupabase
+          .from("economy_wallets")
+          .select("guild_id", { count: "exact", head: true });
+        out.supabaseTableRowCount =
+          typeof cnt.count === "number" ? cnt.count : null;
+        if (cnt.error) {
+          out.supabaseCountError = String(cnt.error.message || "count failed");
+        }
+
         const primary = await economySupabase
           .from("economy_wallets")
           .select("guild_id,user_id,wallet,updated_at")
@@ -901,6 +910,8 @@ function attachArchiveSystem(deps) {
         } else if (primary.data) {
           out.supabasePrimary = primary.data;
           out.wallet = Math.max(0, parseInt(primary.data.wallet || "0", 10) || 0);
+        } else {
+          out.supabasePrimaryFound = false;
         }
 
         if (out.wallet == null) {
@@ -916,7 +927,16 @@ function attachArchiveSystem(deps) {
           } else if (fallback.data) {
             out.supabaseFallback = fallback.data;
             out.wallet = Math.max(0, parseInt(fallback.data.wallet || "0", 10) || 0);
+          } else {
+            out.supabaseFallbackFound = false;
           }
+        }
+
+        if (out.wallet == null && !out.supabasePrimaryError && !out.supabaseFallbackError) {
+          out.diagnosis =
+            out.supabaseTableRowCount === 0
+              ? "Supabase table exists but has no rows yet — restart the Discord bot (with SUPABASE + economy file) so it can upsert, or run any economy command once in the server."
+              : "No wallet row for this guild_id+user_id (and no other row for this user). Confirm ECONOMY_GUILD_ID matches your server and the Discord bot is writing to the same Supabase project.";
         }
       } catch (e) {
         out.supabaseException = String(e?.message || e);
