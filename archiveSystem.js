@@ -13,6 +13,7 @@ const path = require("path");
 
 const DISCORD_API = "https://discord.com/api/v10";
 let mediaBucketEnsurePromise = null;
+let economySupabase = null;
 const ECONOMY_FILE = path.resolve(__dirname, "..", "economy_data.json");
 const START_WALLET = 500;
 let economyLock = Promise.resolve();
@@ -171,6 +172,30 @@ function getWalletFromEntry(entry) {
 }
 
 async function adjustWallet(guildId, userId, delta) {
+  if (economySupabase) {
+    return withEconomyLock(async () => {
+      try {
+        const { data, error } = await economySupabase
+          .from("economy_wallets")
+          .select("wallet")
+          .eq("guild_id", Number(guildId))
+          .eq("user_id", Number(userId))
+          .maybeSingle();
+        if (error) return null;
+        if (!data) return null;
+        const next = Math.max(0, (parseInt(data.wallet || "0", 10) || 0) + delta);
+        const { error: upErr } = await economySupabase
+          .from("economy_wallets")
+          .update({ wallet: next })
+          .eq("guild_id", Number(guildId))
+          .eq("user_id", Number(userId));
+        if (upErr) return null;
+        return next;
+      } catch {
+        return null;
+      }
+    });
+  }
   return withEconomyLock(async () => {
     const all = await readEconomyData();
     const key = resolveEconomyKey(all, guildId, userId);
@@ -188,6 +213,20 @@ async function adjustWallet(guildId, userId, delta) {
 }
 
 async function readWallet(guildId, userId) {
+  if (economySupabase) {
+    try {
+      const { data, error } = await economySupabase
+        .from("economy_wallets")
+        .select("wallet")
+        .eq("guild_id", Number(guildId))
+        .eq("user_id", Number(userId))
+        .maybeSingle();
+      if (error || !data) return null;
+      return Math.max(0, parseInt(data.wallet || "0", 10) || 0);
+    } catch {
+      return null;
+    }
+  }
   const all = await readEconomyData();
   const key = resolveEconomyKey(all, guildId, userId);
   if (!(all[key] && typeof all[key] === "object")) return null;
@@ -691,6 +730,7 @@ function attachArchiveSystem(deps) {
   } = deps;
 
   const authRedirect = SITE_AUTH_REDIRECT_URI;
+  economySupabase = supabase;
   const casinoGuildId = String(ECONOMY_GUILD_ID || ARCHIVE_GUILD_ID || "").trim();
   const mediaChannelId = String(SPECIAL_MEDIA_CHANNEL_ID || "").trim();
   const mediaBackupCfg = {
