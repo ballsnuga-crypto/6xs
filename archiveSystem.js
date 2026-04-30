@@ -20,6 +20,11 @@ const ECONOMY_FILE = process.env.ECONOMY_FILE_PATH
 const START_WALLET = 500;
 let economyLock = Promise.resolve();
 
+/** PostgREST `.eq()` for int8 Discord snowflakes — never `Number()` (MAX_SAFE_INTEGER is 2^53-1). */
+function econBigInt(v) {
+  return String(v);
+}
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -180,15 +185,15 @@ async function adjustWallet(guildId, userId, delta) {
         let { data, error } = await economySupabase
           .from("economy_wallets")
           .select("guild_id,user_id,wallet")
-          .eq("guild_id", Number(guildId))
-          .eq("user_id", Number(userId))
+          .eq("guild_id", econBigInt(guildId))
+          .eq("user_id", econBigInt(userId))
           .maybeSingle();
         if (error) return null;
         if (!data) {
           const fb = await economySupabase
             .from("economy_wallets")
             .select("guild_id,user_id,wallet,updated_at")
-            .eq("user_id", Number(userId))
+            .eq("user_id", econBigInt(userId))
             .order("updated_at", { ascending: false })
             .limit(1)
             .maybeSingle();
@@ -199,8 +204,8 @@ async function adjustWallet(guildId, userId, delta) {
         const { error: upErr } = await economySupabase
           .from("economy_wallets")
           .update({ wallet: next })
-          .eq("guild_id", Number(data.guild_id))
-          .eq("user_id", Number(data.user_id));
+          .eq("guild_id", econBigInt(data.guild_id))
+          .eq("user_id", econBigInt(data.user_id));
         if (upErr) return null;
         return next;
       } catch {
@@ -231,15 +236,15 @@ async function readWallet(guildId, userId) {
       let { data, error } = await economySupabase
         .from("economy_wallets")
         .select("wallet")
-        .eq("guild_id", Number(guildId))
-        .eq("user_id", Number(userId))
+        .eq("guild_id", econBigInt(guildId))
+        .eq("user_id", econBigInt(userId))
         .maybeSingle();
       if (error) data = null;
       if (!data) {
         const fb = await economySupabase
           .from("economy_wallets")
           .select("wallet,updated_at")
-          .eq("user_id", Number(userId))
+          .eq("user_id", econBigInt(userId))
           .order("updated_at", { ascending: false })
           .limit(1)
           .maybeSingle();
@@ -889,6 +894,10 @@ function attachArchiveSystem(deps) {
 
     if (economySupabase) {
       out.sourcesTried.push("supabase");
+      out.walletQueryPair = {
+        guild_id: econBigInt(casinoGuildId),
+        user_id: econBigInt(u.id),
+      };
       try {
         const cnt = await economySupabase
           .from("economy_wallets")
@@ -902,8 +911,8 @@ function attachArchiveSystem(deps) {
         const primary = await economySupabase
           .from("economy_wallets")
           .select("guild_id,user_id,wallet,updated_at")
-          .eq("guild_id", Number(casinoGuildId))
-          .eq("user_id", Number(u.id))
+          .eq("guild_id", econBigInt(casinoGuildId))
+          .eq("user_id", econBigInt(u.id))
           .maybeSingle();
         if (primary.error) {
           out.supabasePrimaryError = String(primary.error.message || "query failed");
@@ -918,7 +927,7 @@ function attachArchiveSystem(deps) {
           const fallback = await economySupabase
             .from("economy_wallets")
             .select("guild_id,user_id,wallet,updated_at")
-            .eq("user_id", Number(u.id))
+            .eq("user_id", econBigInt(u.id))
             .order("updated_at", { ascending: false })
             .limit(1)
             .maybeSingle();
