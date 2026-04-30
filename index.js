@@ -32,6 +32,9 @@ const {
   NODE_ENV,
   VERIFY_ACCESS_ROLE_ID,
 } = process.env;
+const SUPABASE_KEY_RESOLVED = String(
+  SUPABASE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || "",
+);
 
 /** After OAuth, assign this role in DISCORD_GUILD_ID (user must be joinable or already in guild). */
 const VERIFY_ACCESS_ROLE_ID_NORMALIZED = (
@@ -191,7 +194,7 @@ function effectiveOAuthLink() {
 const OAUTH_LINK_EFFECTIVE = effectiveOAuthLink();
 
 const SUPABASE_URL_CLEAN = stripAllWhitespace(SUPABASE_URL);
-const SUPABASE_KEY_CLEAN = (SUPABASE_KEY || "").trim();
+const SUPABASE_KEY_CLEAN = SUPABASE_KEY_RESOLVED.trim();
 
 if (
   !CLIENT_ID ||
