@@ -492,6 +492,11 @@ async function insertArchiveMessage(supabase, message, mediaCfg = null) {
         }))
       : [];
   const author = message.author;
+  const authorDisplayName =
+    message.member?.displayName ||
+    author?.globalName ||
+    author?.username ||
+    null;
   const row = {
     channel_id: String(message.channelId),
     message_id: String(message.id),
@@ -499,6 +504,7 @@ async function insertArchiveMessage(supabase, message, mediaCfg = null) {
     author_id: String(author?.id || "0"),
     author_tag: author?.tag || author?.username || "unknown",
     author_username: author?.username || null,
+    author_display_name: authorDisplayName,
     author_is_bot: Boolean(author?.bot),
     author_avatar_hash: author?.avatar || null,
     content: message.content || "",
@@ -530,6 +536,7 @@ async function insertArchiveMessage(supabase, message, mediaCfg = null) {
       guild_id: row.guild_id,
       author_id: row.author_id,
       author_tag: row.author_tag,
+      author_display_name: row.author_display_name,
       author_is_bot: row.author_is_bot,
       content: row.content,
       attachments: row.attachments,
@@ -544,10 +551,11 @@ async function insertArchiveMessage(supabase, message, mediaCfg = null) {
       onConflict: "channel_id,message_id",
     }));
   }
-  if (error && /author_roles|mention_user_ids|reply_to_/i.test(String(error.message || ""))) {
+  if (error && /author_roles|mention_user_ids|reply_to_|author_display_name/i.test(String(error.message || ""))) {
     const rowNoMeta = { ...row };
     delete rowNoMeta.author_roles;
     delete rowNoMeta.mention_user_ids;
+    delete rowNoMeta.author_display_name;
     delete rowNoMeta.reply_to_message_id;
     delete rowNoMeta.reply_to_author_id;
     delete rowNoMeta.reply_to_author_tag;
@@ -688,6 +696,404 @@ async function fetchDiscordMe(accessToken) {
   });
   if (!meResp.ok) throw new Error("profile fetch failed");
   return meResp.json();
+}
+
+const RESERVED_PROFILE_SLUGS = new Set([
+  "auth",
+  "archive",
+  "api",
+  "admin",
+  "callback",
+  "casino",
+  "favicon.ico",
+  "robots.txt",
+  "profile",
+  "static",
+  "assets",
+  "oauth",
+  "wp",
+]);
+
+function normalizeProfileSlug(raw, userId) {
+  let s = String(raw || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9_]/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_|_$/g, "");
+  s = s.slice(0, 32);
+  if (s.length < 3) {
+    const tail = String(userId || "0")
+      .replace(/\D/g, "")
+      .slice(-8);
+    s = `u_${tail || "user"}`.slice(0, 32);
+  }
+  return s;
+}
+
+function isReservedProfileSlug(slug) {
+  return (
+    !slug ||
+    RESERVED_PROFILE_SLUGS.has(String(slug).toLowerCase()) ||
+    /\./.test(slug) ||
+    !/^[a-z0-9_]+$/.test(slug)
+  );
+}
+
+async function archiveMessageStats(supabase, guildId, authorId) {
+  const gid = String(guildId);
+  const uid = String(authorId);
+  const { count, error } = await supabase
+    .from("archive_messages")
+    .select("*", { count: "exact", head: true })
+    .eq("guild_id", gid)
+    .eq("author_id", uid);
+  if (error) return { error: error.message, total: 0, first_at: null, last_at: null };
+  const total = count ?? 0;
+  if (total <= 0) return { error: null, total: 0, first_at: null, last_at: null };
+  const [{ data: firstRow, error: e1 }, { data: lastRow, error: e2 }] = await Promise.all([
+    supabase
+      .from("archive_messages")
+      .select("created_at_discord")
+      .eq("guild_id", gid)
+      .eq("author_id", uid)
+      .order("created_at_discord", { ascending: true })
+      .limit(1)
+      .maybeSingle(),
+    supabase
+      .from("archive_messages")
+      .select("created_at_discord")
+      .eq("guild_id", gid)
+      .eq("author_id", uid)
+      .order("created_at_discord", { ascending: false })
+      .limit(1)
+      .maybeSingle(),
+  ]);
+  if (e1 || e2) {
+    return { error: (e1 || e2).message, total, first_at: null, last_at: null };
+  }
+  return {
+    error: null,
+    total,
+    first_at: firstRow?.created_at_discord ?? null,
+    last_at: lastRow?.created_at_discord ?? null,
+  };
+}
+
+function sanitizeProfileLinks(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const item of raw.slice(0, 5)) {
+    const label = String(item?.label || "")
+      .trim()
+      .slice(0, 60);
+    let url = String(item?.url || "").trim();
+    if (!label || !url) continue;
+    if (!/^https:\/\//i.test(url)) continue;
+    try {
+      const u = new URL(url);
+      if (u.protocol !== "https:") continue;
+      out.push({ label, url: u.href.slice(0, 500) });
+    } catch {
+      /* skip */
+    }
+  }
+  return out;
+}
+
+async function pickAvailableSlug(supabase, userId, baseSlug) {
+  const uid = String(userId);
+  let b = normalizeProfileSlug(baseSlug, uid);
+  if (isReservedProfileSlug(b)) b = normalizeProfileSlug(`u_${uid.slice(-12)}`, uid);
+  const stem = b.replace(/_\d+$/g, "") || "u";
+  for (let n = 0; n < 100; n++) {
+    const cand = (n === 0 ? b : `${stem}_${n}`).slice(0, 32);
+    const { data, error } = await supabase.from("user_bio_profiles").select("user_id").eq("slug", cand).maybeSingle();
+    if (error) continue;
+    if (!data || String(data.user_id) === uid) return cand;
+  }
+  return normalizeProfileSlug(`u_${uid}`, uid).slice(0, 32);
+}
+
+async function ensureUserBioProfile(supabase, guildId, userId, discordUsername) {
+  const gid = String(guildId);
+  const uid = String(userId);
+  const { data: row, error: readErr } = await supabase.from("user_bio_profiles").select("*").eq("user_id", uid).maybeSingle();
+  if (readErr && !/user_bio_profiles|schema cache/i.test(String(readErr.message || ""))) {
+    console.warn("[profile] read failed:", readErr.message);
+  }
+  if (row) return row;
+  const slug = await pickAvailableSlug(supabase, uid, discordUsername || `user_${uid.slice(-6)}`);
+  const insert = {
+    user_id: uid,
+    guild_id: gid,
+    slug,
+    bio: "",
+    links: [],
+    profile_display_name: null,
+    top_role_override: null,
+    updated_at: new Date().toISOString(),
+  };
+  const ins = await supabase.from("user_bio_profiles").insert(insert).select("*").maybeSingle();
+  if (ins.error) {
+    const again = await supabase.from("user_bio_profiles").select("*").eq("user_id", uid).maybeSingle();
+    if (again.data) return again.data;
+    throw new Error(ins.error.message);
+  }
+  return ins.data;
+}
+
+async function fetchMemberProfileDiscord(bot, guildId, userId) {
+  try {
+    const gid = String(guildId);
+    const uid = String(userId);
+    const g = await bot.guilds.fetch(gid);
+    const m = await g.members.fetch(uid);
+    const tr = m.roles.highest;
+    const topRole =
+      tr && tr.id !== g.id && tr.name !== "@everyone"
+        ? {
+            name: String(tr.name),
+            color: tr.color,
+            hex: typeof tr.hexColor === "string" ? tr.hexColor : null,
+          }
+        : null;
+    return {
+      username: m.user.username,
+      global_name: m.user.globalName || null,
+      display_name: m.displayName,
+      avatar_url: m.displayAvatarURL({ size: 256, extension: "png" }),
+      top_role: topRole,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function formatProfileDate(iso) {
+  if (!iso) return "—";
+  try {
+    const d = new Date(iso);
+    return d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+  } catch {
+    return "—";
+  }
+}
+
+function bioProfilePageHtml(siteBase, payload) {
+  const base = siteBase.replace(/\/$/, "");
+  const {
+    slug,
+    profile,
+    stats,
+    discordMeta,
+    viewerId,
+    profileUrl,
+  } = payload;
+  const headline = escapeHtml(
+    profile?.profile_display_name ||
+      discordMeta?.display_name ||
+      discordMeta?.global_name ||
+      discordMeta?.username ||
+      slug,
+  );
+  const userLine = discordMeta
+    ? escapeHtml(
+        `@${discordMeta.username}` +
+          (discordMeta.global_name && discordMeta.global_name !== discordMeta.username
+            ? ` · ${discordMeta.global_name}`
+            : ""),
+      )
+    : escapeHtml(`@${slug}`);
+  const roleName = profile?.top_role_override
+    ? escapeHtml(profile.top_role_override)
+    : discordMeta?.top_role
+      ? escapeHtml(discordMeta.top_role.name)
+      : "—";
+  let roleColor = "#b5bac1";
+  if (!profile?.top_role_override && discordMeta?.top_role) {
+    const hx = discordMeta.top_role.hex;
+    if (typeof hx === "string" && /^#[0-9a-fA-F]{6}$/.test(hx) && hx.toLowerCase() !== "#000000") {
+      roleColor = hx;
+    } else if (typeof discordMeta.top_role.color === "number" && discordMeta.top_role.color !== 0) {
+      roleColor = `#${discordMeta.top_role.color.toString(16).padStart(6, "0")}`;
+    }
+  }
+  const bioBlock = profile?.bio
+    ? `<div class="bio">${escapeHtml(profile.bio).replace(/\n/g, "<br/>")}</div>`
+    : "";
+  const links = Array.isArray(profile?.links) ? profile.links : [];
+  const linksHtml =
+    links.length > 0
+      ? `<div class="links">${links
+          .map(
+            (l) =>
+              `<a href="${escapeHtml(l.url)}" rel="noopener noreferrer" target="_blank">${escapeHtml(l.label)}</a>`,
+          )
+          .join("")}</div>`
+      : "";
+  const total = stats?.total ?? 0;
+  const span =
+    stats?.first_at && stats?.last_at
+      ? `${formatProfileDate(stats.first_at)} → ${formatProfileDate(stats.last_at)}`
+      : "—";
+  const canEdit =
+    viewerId && profile?.user_id && String(viewerId) === String(profile.user_id);
+  const editBtn = canEdit
+    ? `<p class="edit-row"><a class="btn" href="${escapeHtml(base)}/profile/edit">Edit your profile</a></p>`
+    : "";
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${headline} — 6xs</title>
+  <style>
+    :root { --bg:#0c0d10; --card:#14161c; --border:#252830; --text:#e8eaed; --muted:#9aa0a6; --green:#3ba55d; --accent:#5865f2; }
+    * { box-sizing: border-box; }
+    body { margin:0; min-height:100vh; font-family:system-ui,sans-serif; background:var(--bg); color:var(--text);
+      padding:24px 16px 48px;
+      background-image: radial-gradient(ellipse 80% 50% at 50% -20%, rgba(88,101,242,0.12), transparent); }
+    .wrap { max-width:520px; margin:0 auto; }
+    .card { background:var(--card); border:1px solid var(--border); border-radius:16px; padding:28px; }
+    .avatar { width:96px; height:96px; border-radius:50%; object-fit:cover; display:block; margin:0 auto 16px; background:#1e2128; }
+    h1 { margin:0 0 6px; font-size:1.45rem; text-align:center; }
+    .userline { text-align:center; color:var(--muted); font-size:14px; margin-bottom:16px; }
+    .role-pill { display:inline-block; margin:0 auto 18px; padding:6px 14px; border-radius:999px; font-size:13px; font-weight:600;
+      border:1px solid ${roleColor}; color:${roleColor}; text-align:center; width:100%; box-sizing:border-box; }
+    .stats { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:18px; }
+    .stat { background:#1e2128; border:1px solid var(--border); border-radius:10px; padding:12px; text-align:center; }
+    .stat b { display:block; font-size:1.25rem; margin-bottom:4px; }
+    .stat span { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:0.04em; }
+    .bio { white-space:pre-wrap; line-height:1.5; color:#d1d3d8; font-size:14px; margin-bottom:14px; }
+    .links { display:flex; flex-wrap:wrap; gap:8px; justify-content:center; margin-bottom:8px; }
+    .links a { color:var(--accent); font-size:14px; font-weight:600; text-decoration:none; }
+    .links a:hover { text-decoration:underline; }
+    .fine { text-align:center; font-size:12px; color:var(--muted); margin-top:20px; }
+    .fine a { color:var(--muted); }
+    .edit-row { text-align:center; margin-top:16px; }
+    .btn { display:inline-block; padding:10px 18px; border-radius:10px; font-weight:600; text-decoration:none; background:var(--accent); color:#fff; font-size:14px; }
+    .btn:hover { filter:brightness(1.08); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      ${discordMeta?.avatar_url ? `<img class="avatar" src="${escapeHtml(discordMeta.avatar_url)}" alt="" />` : ""}
+      <h1>${headline}</h1>
+      <div class="userline">${userLine}</div>
+      <div class="role-pill">${roleName}</div>
+      <div class="stats">
+        <div class="stat"><b>${escapeHtml(String(total))}</b><span>Archived messages</span></div>
+        <div class="stat"><b>${escapeHtml(span)}</b><span>Archive span</span></div>
+      </div>
+      ${bioBlock}
+      ${linksHtml}
+      ${editBtn}
+    </div>
+    <p class="fine"><a href="${escapeHtml(base)}">6xs.lol</a> · Profile: <a href="${escapeHtml(profileUrl)}">${escapeHtml(profileUrl.replace(/^https?:\/\//, ""))}</a></p>
+  </div>
+</body>
+</html>`;
+}
+
+function profileEditPageHtml(siteBase, user, profile, stats, errMsg) {
+  const base = siteBase.replace(/\/$/, "");
+  const slug = escapeHtml(profile?.slug || "");
+  const disp = escapeHtml(profile?.profile_display_name || "");
+  const roleOv = escapeHtml(profile?.top_role_override || "");
+  const bio = escapeHtml(profile?.bio || "");
+  const links = Array.isArray(profile?.links) ? profile.links : [];
+  const linkRows = [];
+  for (let i = 0; i < 5; i++) {
+    const L = links[i] || {};
+    linkRows.push(`<div class="link-pair"><input name="link_label_${i}" type="text" placeholder="Label" value="${escapeHtml(L.label || "")}" maxlength="60" />
+      <input name="link_url_${i}" type="url" placeholder="https://…" value="${escapeHtml(L.url || "")}" /></div>`);
+  }
+  const err = errMsg ? `<p class="err">${escapeHtml(errMsg)}</p>` : "";
+  const stTotal = stats?.total ?? 0;
+  const stSpan =
+    stats?.first_at && stats?.last_at
+      ? `${formatProfileDate(stats.first_at)} → ${formatProfileDate(stats.last_at)}`
+      : "—";
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Edit profile — 6xs</title>
+  <style>
+    :root { --bg:#0c0d10; --card:#14161c; --border:#252830; --text:#e8eaed; --muted:#9aa0a6; --accent:#5865f2; --err:#ed4245; }
+    * { box-sizing: border-box; }
+    body { margin:0; min-height:100vh; font-family:system-ui,sans-serif; background:var(--bg); color:var(--text); padding:24px 16px 48px; }
+    .wrap { max-width:560px; margin:0 auto; }
+    h1 { font-size:1.35rem; margin:0 0 8px; }
+    p.sub { color:var(--muted); margin:0 0 20px; font-size:14px; }
+    label { display:block; font-size:12px; color:var(--muted); margin:14px 0 6px; }
+    input[type="text"], input[type="url"], textarea {
+      width:100%; padding:10px 12px; border-radius:8px; border:1px solid var(--border); background:#1e2128; color:var(--text); font-size:14px; }
+    textarea { min-height:120px; resize:vertical; }
+    .link-pair { display:grid; grid-template-columns:1fr 2fr; gap:8px; margin-bottom:8px; }
+    .btn { margin-top:20px; padding:12px 20px; border:none; border-radius:10px; background:var(--accent); color:#fff; font-weight:600; cursor:pointer; font-size:15px; }
+    .btn:hover { filter:brightness(1.08); }
+    .err { color:var(--err); font-size:14px; }
+    .stats-preview { background:#1e2128; border:1px solid var(--border); border-radius:10px; padding:14px; margin-bottom:20px; font-size:13px; color:var(--muted); }
+    .stats-preview strong { color:var(--text); }
+    .nav { margin-bottom:20px; font-size:14px; }
+    .nav a { color:var(--accent); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="nav"><a href="${escapeHtml(base)}/archive">← Archives</a> · <a href="${escapeHtml(base)}/${slug}">View profile</a></div>
+    <h1>Edit your 6xs profile</h1>
+    <p class="sub">Signed in as <strong>${escapeHtml(user.global_name || user.username || "")}</strong>. Your public URL is <strong>${escapeHtml(base)}/</strong><span id="slug-preview">${slug}</span></p>
+    <div class="stats-preview">From archives: <strong>${escapeHtml(String(stTotal))}</strong> messages · span <strong>${escapeHtml(stSpan)}</strong> (not editable — synced from archived channels)</div>
+    ${err}
+    <form id="pf">
+      <label for="slug">URL slug (6xs.lol/…)</label>
+      <input id="slug" name="slug" type="text" value="${slug}" maxlength="32" pattern="[a-z0-9_]{3,32}" autocomplete="off" />
+      <label for="profile_display_name">Profile headline (optional)</label>
+      <input id="profile_display_name" name="profile_display_name" type="text" value="${disp}" maxlength="80" placeholder="Defaults to your Discord display name" />
+      <label for="top_role_override">Role line (optional override)</label>
+      <input id="top_role_override" name="top_role_override" type="text" value="${roleOv}" maxlength="80" placeholder="Leave empty to use your top server role" />
+      <label for="bio">Bio</label>
+      <textarea id="bio" name="bio" maxlength="2000" placeholder="Say something…">${bio}</textarea>
+      <label>Links (https only, max 5)</label>
+      ${linkRows.join("")}
+      <button type="submit" class="btn">Save</button>
+    </form>
+  </div>
+  <script>
+    document.getElementById("slug").addEventListener("input", function () {
+      document.getElementById("slug-preview").textContent = (this.value || "").toLowerCase().replace(/[^a-z0-9_]/g, "_").replace(/_+/g, "_").replace(/^_|_$/g, "").slice(0, 32) || "…";
+    });
+    document.getElementById("pf").onsubmit = async function (e) {
+      e.preventDefault();
+      const links = [];
+      for (var i = 0; i < 5; i++) {
+        var lb = document.querySelector('[name="link_label_' + i + '"]').value.trim();
+        var ur = document.querySelector('[name="link_url_' + i + '"]').value.trim();
+        if (lb && ur) links.push({ label: lb, url: ur });
+      }
+      const body = {
+        slug: document.getElementById("slug").value.trim(),
+        profile_display_name: document.getElementById("profile_display_name").value.trim(),
+        top_role_override: document.getElementById("top_role_override").value.trim(),
+        bio: document.getElementById("bio").value,
+        links: links,
+      };
+      try {
+        const r = await fetch("/api/profile/me", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+        const j = await r.json().catch(function () { return {}; });
+        if (!r.ok) throw new Error(j.error || "Save failed");
+        window.location.href = j.public_path || "/";
+      } catch (err) {
+        alert(err.message || String(err));
+      }
+    };
+  </script>
+</body>
+</html>`;
 }
 
 function cardDeck() {
@@ -852,340 +1258,13 @@ function attachArchiveSystem(deps) {
   });
 
   app.get("/casino", requireArchiveMember, async (req, res) => {
-    res.redirect(302, "/casino/blackjack");
+    res.redirect(302, "/archive");
   });
-
-  app.get("/casino/blackjack", requireArchiveMember, async (req, res) => {
-    const u = req.session.archiveUser;
-    const wallet = await readWallet(casinoGuildId, u.id);
-    res.type("html").send(casinoGameHtml(SITE_BASE, u, wallet ?? 0, "blackjack"));
+  app.get("/casino/:game", requireArchiveMember, async (req, res) => {
+    res.redirect(302, "/archive");
   });
-
-  app.get("/casino/crash", requireArchiveMember, async (req, res) => {
-    const u = req.session.archiveUser;
-    const wallet = await readWallet(casinoGuildId, u.id);
-    res.type("html").send(casinoGameHtml(SITE_BASE, u, wallet ?? 0, "crash"));
-  });
-
-  app.get("/casino/mines", requireArchiveMember, async (req, res) => {
-    const u = req.session.archiveUser;
-    const wallet = await readWallet(casinoGuildId, u.id);
-    res.type("html").send(casinoGameHtml(SITE_BASE, u, wallet ?? 0, "mines"));
-  });
-
-  app.get("/api/casino/balance", requireArchiveMember, async (req, res) => {
-    const u = req.session.archiveUser;
-    const wallet = await readWallet(casinoGuildId, u.id);
-    res.setHeader("Cache-Control", "no-store");
-    if (wallet == null) return res.status(404).json({ error: "No server balance profile found yet. Use economy command in Discord first." });
-    res.json({ wallet });
-  });
-
-  app.get("/api/casino/debug-balance", requireArchiveMember, async (req, res) => {
-    const u = req.session.archiveUser;
-    const out = {
-      userId: String(u.id),
-      guildId: String(casinoGuildId),
-      hasSupabaseClient: Boolean(economySupabase),
-      economyFilePath: ECONOMY_FILE,
-      sourcesTried: [],
-      wallet: null,
-    };
-
-    if (economySupabase) {
-      out.sourcesTried.push("supabase");
-      out.walletQueryPair = {
-        guild_id: econBigInt(casinoGuildId),
-        user_id: econBigInt(u.id),
-      };
-      try {
-        const cnt = await economySupabase
-          .from("economy_wallets")
-          .select("guild_id", { count: "exact", head: true });
-        out.supabaseTableRowCount =
-          typeof cnt.count === "number" ? cnt.count : null;
-        if (cnt.error) {
-          out.supabaseCountError = String(cnt.error.message || "count failed");
-        }
-
-        const primary = await economySupabase
-          .from("economy_wallets")
-          .select("guild_id,user_id,wallet,updated_at")
-          .eq("guild_id", econBigInt(casinoGuildId))
-          .eq("user_id", econBigInt(u.id))
-          .maybeSingle();
-        if (primary.error) {
-          out.supabasePrimaryError = String(primary.error.message || "query failed");
-        } else if (primary.data) {
-          out.supabasePrimary = primary.data;
-          out.wallet = Math.max(0, parseInt(primary.data.wallet || "0", 10) || 0);
-        } else {
-          out.supabasePrimaryFound = false;
-        }
-
-        if (out.wallet == null) {
-          const fallback = await economySupabase
-            .from("economy_wallets")
-            .select("guild_id,user_id,wallet,updated_at")
-            .eq("user_id", econBigInt(u.id))
-            .order("updated_at", { ascending: false })
-            .limit(1)
-            .maybeSingle();
-          if (fallback.error) {
-            out.supabaseFallbackError = String(fallback.error.message || "query failed");
-          } else if (fallback.data) {
-            out.supabaseFallback = fallback.data;
-            out.wallet = Math.max(0, parseInt(fallback.data.wallet || "0", 10) || 0);
-          } else {
-            out.supabaseFallbackFound = false;
-          }
-        }
-
-        if (out.wallet == null && !out.supabasePrimaryError && !out.supabaseFallbackError) {
-          out.diagnosis =
-            out.supabaseTableRowCount === 0
-              ? "Supabase table exists but has no rows yet — restart the Discord bot (with SUPABASE + economy file) so it can upsert, or run any economy command once in the server."
-              : "No wallet row for this guild_id+user_id (and no other row for this user). Confirm ECONOMY_GUILD_ID matches your server and the Discord bot is writing to the same Supabase project.";
-        }
-      } catch (e) {
-        out.supabaseException = String(e?.message || e);
-      }
-    }
-
-    if (out.wallet == null) {
-      out.sourcesTried.push("local_file");
-      try {
-        const all = await readEconomyData();
-        const key = resolveEconomyKey(all, casinoGuildId, u.id);
-        out.localKey = key;
-        out.localKeyExists = Boolean(all[key] && typeof all[key] === "object");
-        if (out.localKeyExists) {
-          out.wallet = getWalletFromEntry(all[key]);
-        }
-      } catch (e) {
-        out.localFileException = String(e?.message || e);
-      }
-    }
-
-    res.setHeader("Cache-Control", "no-store");
-    res.json(out);
-  });
-
-  app.post("/api/casino/blackjack/start", requireArchiveMember, async (req, res) => {
-    const u = req.session.archiveUser;
-    const bet = Math.max(1, parseInt(req.body?.bet || "0", 10) || 0);
-    const wallet = await readWallet(casinoGuildId, u.id);
-    if (wallet == null) return res.status(400).json({ error: "No server balance profile found yet. Use 6bal once in server." });
-    if (bet <= 0 || bet > wallet) return res.status(400).json({ error: "Invalid bet amount." });
-    const walletAfterBet = await adjustWallet(casinoGuildId, u.id, -bet);
-    if (walletAfterBet == null) return res.status(400).json({ error: "Could not use server balance profile." });
-    const deck = cardDeck();
-    const player = [deck.pop(), deck.pop()];
-    const dealer = [deck.pop(), deck.pop()];
-    const state = { bet, deck, player, dealer, done: false };
-    req.session.casino = req.session.casino || {};
-    req.session.casino.bj = state;
-    const p = handTotal(player);
-    if (p === 21) {
-      const payout = Math.floor(bet * 2.5);
-      const walletNow = await adjustWallet(casinoGuildId, u.id, payout);
-      if (walletNow == null) return res.status(400).json({ error: "Could not update server balance profile." });
-      req.session.casino.bj = null;
-      return res.json({ done: true, result: "blackjack", payout, wallet: walletNow, player, dealer, playerTotal: p, dealerTotal: handTotal(dealer) });
-    }
-    res.json({ done: false, wallet: walletAfterBet, player, dealerUp: [dealer[0]], playerTotal: p });
-  });
-
-  app.post("/api/casino/blackjack/hit", requireArchiveMember, async (req, res) => {
-    const u = req.session.archiveUser;
-    const state = req.session?.casino?.bj;
-    if (!state || state.done) return res.status(400).json({ error: "No active blackjack round." });
-    state.player.push(state.deck.pop());
-    const p = handTotal(state.player);
-    if (p > 21) {
-      state.done = true;
-      req.session.casino.bj = null;
-      const wallet = await readWallet(casinoGuildId, u.id);
-      if (wallet == null) return res.status(400).json({ error: "No server balance profile found yet." });
-      return res.json({ done: true, result: "bust", payout: 0, wallet, player: state.player, dealer: state.dealer, playerTotal: p, dealerTotal: handTotal(state.dealer) });
-    }
-    req.session.casino.bj = state;
-    const wallet = await readWallet(casinoGuildId, u.id);
-    if (wallet == null) return res.status(400).json({ error: "No server balance profile found yet." });
-    res.json({ done: false, wallet, player: state.player, dealerUp: [state.dealer[0]], playerTotal: p });
-  });
-
-  app.post("/api/casino/blackjack/stand", requireArchiveMember, async (req, res) => {
-    const u = req.session.archiveUser;
-    const state = req.session?.casino?.bj;
-    if (!state || state.done) return res.status(400).json({ error: "No active blackjack round." });
-    while (handTotal(state.dealer) < 17) state.dealer.push(state.deck.pop());
-    const p = handTotal(state.player);
-    const d = handTotal(state.dealer);
-    let result = "lose";
-    let payout = 0;
-    if (d > 21 || p > d) {
-      result = "win";
-      payout = state.bet * 2;
-    } else if (p === d) {
-      result = "push";
-      payout = state.bet;
-    }
-    const wallet = payout > 0 ? await adjustWallet(casinoGuildId, u.id, payout) : await readWallet(casinoGuildId, u.id);
-    if (wallet == null) return res.status(400).json({ error: "Could not update server balance profile." });
-    req.session.casino.bj = null;
-    res.json({ done: true, result, payout, wallet, player: state.player, dealer: state.dealer, playerTotal: p, dealerTotal: d });
-  });
-
-  app.post("/api/casino/crash/play", requireArchiveMember, async (req, res) => {
-    const u = req.session.archiveUser;
-    const bet = Math.max(1, parseInt(req.body?.bet || "0", 10) || 0);
-    const cashout = Math.max(1.01, Number(req.body?.cashout || 1.5));
-    const wallet = await readWallet(casinoGuildId, u.id);
-    if (wallet == null) return res.status(400).json({ error: "No server balance profile found yet. Use 6bal once in server." });
-    if (bet <= 0 || bet > wallet) return res.status(400).json({ error: "Invalid bet amount." });
-    const afterBet = await adjustWallet(casinoGuildId, u.id, -bet);
-    if (afterBet == null) return res.status(400).json({ error: "Could not use server balance profile." });
-    const roll = Math.random();
-    const crashPoint = Math.max(1.0, Number((1 + (roll * 9.5)).toFixed(2)));
-    const win = cashout <= crashPoint;
-    const payout = win ? Math.floor(bet * cashout) : 0;
-    const walletNow = payout > 0 ? await adjustWallet(casinoGuildId, u.id, payout) : await readWallet(casinoGuildId, u.id);
-    if (walletNow == null) return res.status(400).json({ error: "Could not update server balance profile." });
-    res.json({ crashPoint, cashout, win, payout, wallet: walletNow });
-  });
-
-  app.post("/api/casino/mines/play", requireArchiveMember, async (req, res) => {
-    const u = req.session.archiveUser;
-    const bet = Math.max(1, parseInt(req.body?.bet || "0", 10) || 0);
-    const tiles = Math.max(5, Math.min(30, parseInt(req.body?.tiles || "25", 10) || 25));
-    const mines = Math.max(1, Math.min(24, parseInt(req.body?.mines || "3", 10) || 3));
-    const maxPicks = Math.max(1, tiles - mines);
-    const picks = Math.max(1, Math.min(maxPicks, parseInt(req.body?.picks || "1", 10) || 1));
-    if (mines >= tiles) return res.status(400).json({ error: "Mines must be less than tiles." });
-    const wallet = await readWallet(casinoGuildId, u.id);
-    if (wallet == null) return res.status(400).json({ error: "No server balance profile found yet. Use 6bal once in server." });
-    if (bet <= 0 || bet > wallet) return res.status(400).json({ error: "Invalid bet amount." });
-    const afterBet = await adjustWallet(casinoGuildId, u.id, -bet);
-    if (afterBet == null) return res.status(400).json({ error: "Could not use server balance profile." });
-
-    const pool = [...Array(tiles).keys()];
-    for (let i = pool.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [pool[i], pool[j]] = [pool[j], pool[i]];
-    }
-    const mineSet = new Set(pool.slice(0, mines));
-    const pickPool = [...Array(tiles).keys()].filter((i) => !mineSet.has(i));
-    for (let i = pickPool.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [pickPool[i], pickPool[j]] = [pickPool[j], pickPool[i]];
-    }
-    const chosen = pickPool.slice(0, picks);
-    const hitMine = chosen.some((x) => mineSet.has(x));
-    let mult = 1;
-    if (!hitMine) {
-      for (let i = 0; i < picks; i++) {
-        mult *= (tiles - i) / (tiles - mines - i);
-      }
-      mult *= 0.96;
-    }
-    const payout = hitMine ? 0 : Math.floor(bet * mult);
-    const walletNow = payout > 0 ? await adjustWallet(casinoGuildId, u.id, payout) : await readWallet(casinoGuildId, u.id);
-    if (walletNow == null) return res.status(400).json({ error: "Could not update server balance profile." });
-    res.json({
-      win: !hitMine,
-      payout,
-      multiplier: Number(mult.toFixed(3)),
-      wallet: walletNow,
-      tiles,
-      mines,
-      picks,
-    });
-  });
-
-  app.post("/api/casino/mines/start", requireArchiveMember, async (req, res) => {
-    const u = req.session.archiveUser;
-    const bet = Math.max(1, parseInt(req.body?.bet || "0", 10) || 0);
-    const tiles = Math.max(5, Math.min(25, parseInt(req.body?.tiles || "25", 10) || 25));
-    const mines = Math.max(1, Math.min(24, parseInt(req.body?.mines || "3", 10) || 3));
-    if (mines >= tiles) return res.status(400).json({ error: "Mines must be less than tiles." });
-    const wallet = await readWallet(casinoGuildId, u.id);
-    if (wallet == null) return res.status(400).json({ error: "No server balance profile found yet. Use 6bal once in server." });
-    if (bet <= 0 || bet > wallet) return res.status(400).json({ error: "Invalid bet amount." });
-    const walletAfterBet = await adjustWallet(casinoGuildId, u.id, -bet);
-    if (walletAfterBet == null) return res.status(400).json({ error: "Could not use server balance profile." });
-
-    const pool = [...Array(tiles).keys()];
-    for (let i = pool.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [pool[i], pool[j]] = [pool[j], pool[i]];
-    }
-    const mineTiles = pool.slice(0, mines);
-    req.session.casino = req.session.casino || {};
-    req.session.casino.mines = {
-      bet,
-      tiles,
-      mines,
-      mineTiles,
-      picked: [],
-      done: false,
-    };
-    res.json({ wallet: walletAfterBet, tiles, mines, picked: [], multiplier: 1, potential_payout: 0 });
-  });
-
-  app.post("/api/casino/mines/pick", requireArchiveMember, async (req, res) => {
-    const u = req.session.archiveUser;
-    const game = req.session?.casino?.mines;
-    if (!game || game.done) return res.status(400).json({ error: "No active mines game." });
-    const tile = parseInt(req.body?.tile || "-1", 10);
-    if (!Number.isFinite(tile) || tile < 0 || tile >= game.tiles) return res.status(400).json({ error: "Invalid tile." });
-    if (game.picked.includes(tile)) return res.status(400).json({ error: "Tile already picked." });
-
-    if (game.mineTiles.includes(tile)) {
-      game.done = true;
-      req.session.casino.mines = null;
-      const walletNow = await readWallet(casinoGuildId, u.id);
-      if (walletNow == null) return res.status(400).json({ error: "No server balance profile found yet." });
-      return res.json({ done: true, hit_mine: true, tile, wallet: walletNow, picked: [...game.picked], reveal_mines: game.mineTiles });
-    }
-
-    game.picked.push(tile);
-    const mult = minesMultiplier(game.tiles, game.mines, game.picked.length);
-    const potential = Math.floor(game.bet * mult);
-    req.session.casino.mines = game;
-    const walletNow = await readWallet(casinoGuildId, u.id);
-    if (walletNow == null) return res.status(400).json({ error: "No server balance profile found yet." });
-    res.json({
-      done: false,
-      hit_mine: false,
-      tile,
-      wallet: walletNow,
-      picked: [...game.picked],
-      multiplier: mult,
-      potential_payout: potential,
-    });
-  });
-
-  app.post("/api/casino/mines/cashout", requireArchiveMember, async (req, res) => {
-    const u = req.session.archiveUser;
-    const game = req.session?.casino?.mines;
-    if (!game || game.done) return res.status(400).json({ error: "No active mines game." });
-    if (!game.picked.length) return res.status(400).json({ error: "Pick at least one tile first." });
-    const mult = minesMultiplier(game.tiles, game.mines, game.picked.length);
-    const payout = Math.floor(game.bet * mult);
-    const walletNow = await adjustWallet(casinoGuildId, u.id, payout);
-    if (walletNow == null) return res.status(400).json({ error: "Could not update server balance profile." });
-    req.session.casino.mines = null;
-    res.json({
-      done: true,
-      cashed_out: true,
-      multiplier: mult,
-      payout,
-      wallet: walletNow,
-      picked: [...game.picked],
-      tiles: game.tiles,
-      mines: game.mines,
-    });
+  app.all("/api/casino/*", requireArchiveMember, async (req, res) => {
+    res.status(410).json({ error: "Casino has been removed from the website." });
   });
 
   app.get("/api/archive/:channelId", requireArchiveMember, async (req, res) => {
@@ -1208,6 +1287,7 @@ function attachArchiveSystem(deps) {
     if (qRaw) qb = qb.ilike("content", `%${sanitizeIlike(qRaw)}%`);
 
     const authorId = String(req.query.author_id || "").trim();
+    let authorLikeForRetry = "";
     if (/^\d{17,22}$/.test(authorId)) {
       qb = qb.eq("author_id", authorId);
     } else {
@@ -1217,7 +1297,8 @@ function attachArchiveSystem(deps) {
         .slice(0, 48);
       if (authorLike) {
         const s = sanitizeIlike(authorLike);
-        qb = qb.or(`author_tag.ilike.%${s}%,author_username.ilike.%${s}%`);
+        authorLikeForRetry = s;
+        qb = qb.or(`author_display_name.ilike.%${s}%,author_tag.ilike.%${s}%,author_username.ilike.%${s}%`);
       }
     }
 
@@ -1237,9 +1318,27 @@ function attachArchiveSystem(deps) {
       qb = qb.lte("created_at_discord", new Date(dateTo).toISOString());
     }
 
-    const { data, error, count } = await qb
+    let { data, error, count } = await qb
       .order("created_at_discord", { ascending: false })
       .range(offset, offset + limit - 1);
+    if (error && /author_display_name/i.test(String(error.message || "")) && authorLikeForRetry) {
+      const legacyQb = supabase.from("archive_messages").select("*", { count: "exact" }).eq("channel_id", channelId);
+      const qRaw2 = String(req.query.q || "").trim();
+      if (qRaw2) legacyQb.ilike("content", `%${sanitizeIlike(qRaw2)}%`);
+      if (/^\d{17,22}$/.test(authorId)) {
+        legacyQb.eq("author_id", authorId);
+      } else {
+        legacyQb.or(`author_tag.ilike.%${authorLikeForRetry}%,author_username.ilike.%${authorLikeForRetry}%`);
+      }
+      const mentionUser2 = String(req.query.mentions || "").trim();
+      if (/^\d{17,22}$/.test(mentionUser2)) legacyQb.contains("mention_user_ids", [mentionUser2]);
+      if (hideBots) legacyQb.eq("author_is_bot", false);
+      if (dateFrom && !Number.isNaN(Date.parse(dateFrom))) legacyQb.gte("created_at_discord", new Date(dateFrom).toISOString());
+      if (dateTo && !Number.isNaN(Date.parse(dateTo))) legacyQb.lte("created_at_discord", new Date(dateTo).toISOString());
+      ({ data, error, count } = await legacyQb
+        .order("created_at_discord", { ascending: false })
+        .range(offset, offset + limit - 1));
+    }
 
     if (error) return res.status(500).json({ error: error.message });
     res.json({
@@ -1314,6 +1413,128 @@ function attachArchiveSystem(deps) {
     const labels = CHANNEL_LABELS || {};
     const title = labels[channelId] || "#archive";
     res.type("html").send(archivePostHtml(SITE_BASE, u, channelId, messageId, title));
+  });
+
+  app.get("/profile/edit", requireArchiveMember, async (req, res) => {
+    const u = req.session.archiveUser;
+    const gid = String(ARCHIVE_GUILD_ID || "").trim();
+    if (!gid) return res.status(500).type("html").send("Server missing ARCHIVE_GUILD_ID");
+    try {
+      const profile = await ensureUserBioProfile(supabase, gid, u.id, u.username);
+      const stats = await archiveMessageStats(supabase, gid, u.id);
+      res.type("html").send(profileEditPageHtml(SITE_BASE, u, profile, stats, null));
+    } catch (e) {
+      console.error("[profile/edit]", e);
+      res
+        .status(500)
+        .type("html")
+        .send(
+          `<!DOCTYPE html><html><body style="font-family:system-ui;background:#0c0d10;color:#e8eaed;padding:2rem;max-width:560px;margin:0 auto"><p>Could not load profile editor. If the database table is missing, run <code>supabase_user_bio_migrate.sql</code> in Supabase.</p><p style="color:#ed4245">${escapeHtml(String(e.message || e))}</p><p><a href="/archive" style="color:#5865f2">Back</a></p></body></html>`,
+        );
+    }
+  });
+
+  app.get("/api/profile/me", requireArchiveMember, async (req, res) => {
+    const u = req.session.archiveUser;
+    const gid = String(ARCHIVE_GUILD_ID || "").trim();
+    try {
+      const profile = await ensureUserBioProfile(supabase, gid, u.id, u.username);
+      const stats = await archiveMessageStats(supabase, gid, u.id);
+      const discordMeta = await fetchMemberProfileDiscord(bot, gid, u.id);
+      res.json({ profile, stats, discord: discordMeta });
+    } catch (e) {
+      res.status(500).json({ error: String(e.message || e) });
+    }
+  });
+
+  app.post("/api/profile/me", requireArchiveMember, async (req, res) => {
+    const u = req.session.archiveUser;
+    const gid = String(ARCHIVE_GUILD_ID || "").trim();
+    const body = req.body && typeof req.body === "object" ? req.body : {};
+    try {
+      await ensureUserBioProfile(supabase, gid, u.id, u.username);
+      const wantSlug = normalizeProfileSlug(body.slug != null ? body.slug : u.username, u.id);
+      if (isReservedProfileSlug(wantSlug)) {
+        return res.status(400).json({ error: "Invalid or reserved URL slug." });
+      }
+      const { data: taken } = await supabase.from("user_bio_profiles").select("user_id").eq("slug", wantSlug).maybeSingle();
+      if (taken && String(taken.user_id) !== String(u.id)) {
+        return res.status(400).json({ error: "That slug is already taken." });
+      }
+      const bio = String(body.bio != null ? body.bio : "").slice(0, 2000);
+      const profile_display_name = String(body.profile_display_name != null ? body.profile_display_name : "")
+        .trim()
+        .slice(0, 80);
+      const top_role_override = String(body.top_role_override != null ? body.top_role_override : "")
+        .trim()
+        .slice(0, 80);
+      const links = sanitizeProfileLinks(body.links);
+      const upd = await supabase
+        .from("user_bio_profiles")
+        .update({
+          slug: wantSlug,
+          bio,
+          links,
+          profile_display_name: profile_display_name || null,
+          top_role_override: top_role_override || null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("user_id", String(u.id))
+        .select("*")
+        .maybeSingle();
+      if (upd.error) return res.status(500).json({ error: upd.error.message });
+      const base = SITE_BASE.replace(/\/$/, "");
+      res.json({ ok: true, profile: upd.data, public_path: `/${wantSlug}`, public_url: `${base}/${wantSlug}` });
+    } catch (e) {
+      res.status(500).json({ error: String(e.message || e) });
+    }
+  });
+
+  app.get("/api/profile/public/:slug", async (req, res) => {
+    const slug = String(req.params.slug || "").toLowerCase();
+    if (isReservedProfileSlug(slug)) return res.status(404).json({ error: "not found" });
+    const { data: profile, error } = await supabase.from("user_bio_profiles").select("*").eq("slug", slug).maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    if (!profile) return res.status(404).json({ error: "not found" });
+    const gid = String(profile.guild_id || ARCHIVE_GUILD_ID || "").trim();
+    const stats = await archiveMessageStats(supabase, gid, profile.user_id);
+    const discordMeta = await fetchMemberProfileDiscord(bot, gid, profile.user_id);
+    res.json({ profile, stats, discord: discordMeta });
+  });
+
+  app.get("/:profileSlug", async (req, res, next) => {
+    const slug = String(req.params.profileSlug || "").toLowerCase();
+    if (isReservedProfileSlug(slug)) return next();
+    try {
+      const { data: profile, error } = await supabase.from("user_bio_profiles").select("*").eq("slug", slug).maybeSingle();
+      if (error) {
+        if (/user_bio_profiles|schema cache/i.test(String(error.message || ""))) {
+          return res.status(503).type("html").send(`<!DOCTYPE html><html><body style="font-family:system-ui;background:#0c0d10;color:#e8eaed;padding:2rem">Bio profiles are not set up yet.</body></html>`);
+        }
+        return next();
+      }
+      if (!profile) return next();
+      const gid = String(profile.guild_id || ARCHIVE_GUILD_ID || "").trim();
+      const stats = await archiveMessageStats(supabase, gid, profile.user_id);
+      const discordMeta = await fetchMemberProfileDiscord(bot, gid, profile.user_id);
+      const viewerId = req.session?.archiveUser?.id || null;
+      const base = SITE_BASE.replace(/\/$/, "");
+      const profileUrl = `${base}/${slug}`;
+      await logAccess(supabase, req, viewerId, `/${slug}`, "profile_view");
+      res.type("html").send(
+        bioProfilePageHtml(SITE_BASE, {
+          slug,
+          profile,
+          stats,
+          discordMeta,
+          viewerId,
+          profileUrl,
+        }),
+      );
+    } catch (e) {
+      console.error("[profile page]", e);
+      next();
+    }
   });
 
   bot.on("messageCreate", async (message) => {
@@ -1492,6 +1713,7 @@ function landingHtml(siteBase, loggedIn) {
     <p>Read-only mirrors of rotating Discord channels. You must be a member of the 6xs server and sign in with Discord.</p>
     ${loggedIn
       ? `<a class="btn btn-green" href="${escapeHtml(siteBase)}/archive">Open archives</a>
+         <p style="margin:16px 0 0"><a class="btn" href="${escapeHtml(siteBase)}/profile/edit" style="background:#313338">Edit profile / bio link</a></p>
          <p class="fine"><a href="${escapeHtml(siteBase)}/auth/logout" style="color:var(--muted)">Log out</a></p>`
       : `<a class="btn" href="${escapeHtml(login)}">Log in with Discord</a>
          <p class="fine">We only check membership — no posting from the web.</p>`}
@@ -1584,7 +1806,7 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
 <body class="archive-page">
   <header>
     <span>Signed in as <strong>${name}</strong></span>
-    <span><a href="/">Home</a> · <a href="/casino">Casino</a> · <span id="top-balance">Balance: …</span> · <a href="/auth/logout">Log out</a></span>
+    <span><a href="/profile/edit">Profile</a> · <a href="/">Home</a> · <a href="/auth/logout">Log out</a></span>
   </header>
   <div class="filters-wrap">
     <button type="button" class="filters-toggle" id="filters-toggle">
@@ -1593,7 +1815,7 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
   <div class="filters" id="filters">
     <div class="field"><label for="f-q">Contains</label><input type="search" id="f-q" placeholder="Search message text…" /></div>
     <div class="field"><label for="f-author-id">From user ID</label><input type="text" id="f-author-id" placeholder="Snowflake" inputmode="numeric" /></div>
-    <div class="field"><label for="f-author">Username contains</label><input type="text" id="f-author" placeholder="e.g. rain" /></div>
+    <div class="field"><label for="f-author">Display/username contains</label><input type="text" id="f-author" placeholder="e.g. raindear" /></div>
     <div class="field"><label for="f-from">After</label><input type="datetime-local" id="f-from" /></div>
     <div class="field"><label for="f-to">Before</label><input type="datetime-local" id="f-to" /></div>
     <div class="field"><label for="f-mentions">Mentions user ID</label><input type="text" id="f-mentions" placeholder="Who was @'d" /></div>
@@ -1634,24 +1856,6 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
     const stats = document.getElementById("stats");
     const sentinel = document.getElementById("sentinel");
     const sentinelMsg = document.getElementById("sentinel-msg");
-    function refreshTopBalance() {
-      fetch("/api/casino/balance", { cache: "no-store" })
-        .then((r) => r.json().catch(() => null).then((j) => ({ ok: r.ok, j: j })))
-        .then((x) => {
-          if (!x || !x.ok || !x.j || x.j.wallet == null) {
-            document.getElementById("top-balance").textContent = "Balance: unavailable";
-            return;
-          }
-          var b = Number(x.j.wallet || 0);
-          document.getElementById("top-balance").textContent = "Balance: " + b.toLocaleString() + " coins";
-        })
-        .catch(() => {
-          document.getElementById("top-balance").textContent = "Balance: unavailable";
-        });
-    }
-    refreshTopBalance();
-    setInterval(refreshTopBalance, 10000);
-
     CHANNEL_IDS.forEach((id) => {
       const b = document.createElement("button");
       b.textContent = LABELS[id] || ("#" + id.slice(-6));
@@ -1781,7 +1985,7 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
       var div = document.createElement("div");
       div.className = "msg";
       var when = row.created_at_discord ? new Date(row.created_at_discord).toLocaleString() : "";
-      var disp = row.author_tag || row.author_username || row.author_id;
+      var disp = row.author_display_name || row.author_tag || row.author_username || row.author_id;
       var body = renderAttachments(row.attachments);
       if (!body) body = '<div class="content">' + formatContent(row.content || "") + "</div>";
       var sitePost =
@@ -1825,7 +2029,7 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
       div.className = "msg";
       if (row.message_id) div.dataset.mid = String(row.message_id);
       var when = row.created_at_discord ? new Date(row.created_at_discord).toLocaleString() : "";
-      var disp = row.author_tag || row.author_username || row.author_id;
+      var disp = row.author_display_name || row.author_tag || row.author_username || row.author_id;
       var nameStyle = displayNameStyle(row.author_roles || []);
       div.innerHTML =
         renderReply(row) +
@@ -2236,7 +2440,7 @@ function archivePostHtml(siteBase, user, channelId, messageId, channelTitle) {
       .then(function (j) {
         var row = j.row || {};
         var when = row.created_at_discord ? new Date(row.created_at_discord).toLocaleString() : "";
-        var who = row.author_tag || row.author_username || row.author_id || "unknown";
+        var who = row.author_display_name || row.author_tag || row.author_username || row.author_id || "unknown";
         var post = document.getElementById("post");
         post.innerHTML =
           '<div class="meta"><strong>' + esc(String(who)) + "</strong> · " + esc(when) + "</div>" +
