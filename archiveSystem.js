@@ -1263,7 +1263,8 @@ function attachArchiveSystem(deps) {
   app.get("/casino/:game", requireArchiveMember, async (req, res) => {
     res.redirect(302, "/archive");
   });
-  app.all("/api/casino/*", requireArchiveMember, async (req, res) => {
+  // Express 5 / path-to-regexp v8 rejects "/api/casino/*" (bare *). Match any /api/casino subpath.
+  app.all(/^\/api\/casino(?:\/.*)?$/i, requireArchiveMember, async (req, res) => {
     res.status(410).json({ error: "Casino has been removed from the website." });
   });
 
