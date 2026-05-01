@@ -124,19 +124,44 @@ function rewriteSupabasePublicToCdn(url, cdnBase, bucket) {
 }
 
 function applyMediaCdnToRow(row, cdnBase, bucket) {
-  if (!row || !Array.isArray(row.attachments)) return row;
+  if (!row || typeof row !== "object") return row;
   const out = { ...row };
-  out.attachments = row.attachments.map((a) => {
-    const x = { ...(a || {}) };
-    if (x.mirroredUrl) {
-      x.mirroredUrl = rewriteSupabasePublicToCdn(x.mirroredUrl, cdnBase, bucket);
-    }
-    if (x.mirrored_url) {
-      x.mirrored_url = rewriteSupabasePublicToCdn(x.mirrored_url, cdnBase, bucket);
-    }
-    return x;
-  });
+  if (Array.isArray(out.attachments)) {
+    out.attachments = out.attachments.map((a) => {
+      const x = { ...(a || {}) };
+      if (x.mirroredUrl) {
+        x.mirroredUrl = rewriteSupabasePublicToCdn(x.mirroredUrl, cdnBase, bucket);
+      }
+      if (x.mirrored_url) {
+        x.mirrored_url = rewriteSupabasePublicToCdn(x.mirrored_url, cdnBase, bucket);
+      }
+      return x;
+    });
+  }
   return out;
+}
+
+/** Supabase/PostgREST may return jsonb `author_roles` as a JSON string — normalize for the web UI. */
+function parseAuthorRolesJsonb(v) {
+  if (v == null) return [];
+  if (Array.isArray(v)) return v;
+  if (typeof v === "string") {
+    const s = v.trim();
+    if (!s || s === "null") return [];
+    try {
+      const p = JSON.parse(s);
+      return Array.isArray(p) ? p : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+function normalizeArchiveMessageRow(row, cdnBase, bucket) {
+  if (!row || typeof row !== "object") return row;
+  const out = { ...row, author_roles: parseAuthorRolesJsonb(row.author_roles) };
+  return applyMediaCdnToRow(out, cdnBase, bucket);
 }
 
 function withEconomyLock(fn) {
@@ -1343,7 +1368,7 @@ function attachArchiveSystem(deps) {
 
     if (error) return res.status(500).json({ error: error.message });
     res.json({
-      rows: (data || []).map((r) => applyMediaCdnToRow(r, mediaCdnBase, mediaBackupCfg.bucket)),
+      rows: (data || []).map((r) => normalizeArchiveMessageRow(r, mediaCdnBase, mediaBackupCfg.bucket)),
       total: count ?? null,
       limit,
       offset,
@@ -1381,7 +1406,7 @@ function attachArchiveSystem(deps) {
       hasMore = true;
     }
     res.json({
-      rows: rows.slice(0, limit).map((r) => applyMediaCdnToRow(r, mediaCdnBase, mediaBackupCfg.bucket)),
+      rows: rows.slice(0, limit).map((r) => normalizeArchiveMessageRow(r, mediaCdnBase, mediaBackupCfg.bucket)),
       total: null,
       limit,
       offset,
@@ -1402,7 +1427,7 @@ function attachArchiveSystem(deps) {
       .maybeSingle();
     if (error) return res.status(500).json({ error: error.message });
     if (!data) return res.status(404).json({ error: "not found" });
-    res.json({ row: applyMediaCdnToRow(data, mediaCdnBase, mediaBackupCfg.bucket) });
+    res.json({ row: normalizeArchiveMessageRow(data, mediaCdnBase, mediaBackupCfg.bucket) });
   });
 
   app.get("/archive/post/:channelId/:messageId", requireArchiveMember, async (req, res) => {
@@ -1789,6 +1814,7 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
     .msg-head img.av { width:40px; height:40px; border-radius:50%; object-fit:cover; background:#1e2128; flex-shrink:0; }
     .meta { font-size:12px; color:var(--muted); line-height:1.35; }
     .meta strong { color:var(--text); font-size:15px; font-weight:600; }
+    .meta .at-username { color:#949ba4; font-size:13px; font-weight:500; }
     .role-row { display:flex; flex-wrap:wrap; gap:4px; margin-top:4px; align-items:center; }
     .role-pill { font-size:11px; font-weight:600; padding:2px 8px; border-radius:4px; border:1px solid; max-width:180px;
       overflow:hidden; text-overflow:ellipsis; white-space:nowrap; line-height:1.3; }
@@ -1982,17 +2008,72 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
       }
     }
 
+    function normalizeAuthorRoles(raw) {
+      if (raw == null) return [];
+      if (typeof raw === "string") {
+        var s = raw.trim();
+        if (!s || s === "null") return [];
+        try {
+          return normalizeAuthorRoles(JSON.parse(s));
+        } catch (e0) {
+          return [];
+        }
+      }
+      if (!Array.isArray(raw)) {
+        if (typeof raw === "object" && raw && raw.id != null) return [normalizeRoleObject(raw)];
+        return [];
+      }
+      var out = [];
+      for (var j = 0; j < raw.length; j++) out.push(normalizeRoleObject(raw[j]));
+      return out;
+    }
+    function normalizeRoleObject(r) {
+      if (!r || typeof r !== "object") return { id: "", name: "", color: 0, hexColor: null };
+      var c = r.color;
+      if (typeof c === "string") {
+        var cs = c.trim();
+        c = /^-?\\d+$/.test(cs) ? parseInt(cs, 10) : 0;
+      } else if (typeof c !== "number" || !Number.isFinite(c)) {
+        c = 0;
+      }
+      var hx = r.hexColor || r.hex_color || null;
+      if (typeof hx !== "string" || hx === "#000000") hx = null;
+      return {
+        id: String(r.id != null ? r.id : ""),
+        name: String(r.name != null ? r.name : "").slice(0, 80),
+        color: c,
+        hexColor: hx,
+      };
+    }
+    function formatAuthorDisplayParts(row) {
+      var dn = String(row.author_display_name || "").trim();
+      var un = String(row.author_username || "").trim();
+      var tag = String(row.author_tag || "").trim();
+      if (!dn && tag) {
+        var hash = tag.indexOf("#");
+        dn = hash > 0 ? tag.slice(0, hash) : tag;
+      }
+      if (!dn) dn = un || String(row.author_id || "");
+      var showAt = un && un !== dn;
+      return { display: dn, username: un, showAt: showAt };
+    }
+    function authorNameHtml(row, nameStyle) {
+      var p = formatAuthorDisplayParts(row);
+      var at = p.showAt ? '<span class="at-username">@' + escapeHtml(p.username) + "</span>" : "";
+      return '<strong style="' + nameStyle + '">' + escapeHtml(p.display) + "</strong>" + at;
+    }
+
     function renderMediaCard(row) {
       var div = document.createElement("div");
       div.className = "msg";
       var when = row.created_at_discord ? new Date(row.created_at_discord).toLocaleString() : "";
-      var disp = row.author_display_name || row.author_tag || row.author_username || row.author_id;
+      var nameStyle = displayNameStyle(normalizeAuthorRoles(row.author_roles));
       var body = renderAttachments(row.attachments);
       if (!body) body = '<div class="content">' + formatContent(row.content || "") + "</div>";
       var sitePost =
         "/archive/post/" + encodeURIComponent(String(row.channel_id || "")) + "/" + encodeURIComponent(String(row.message_id || ""));
       div.innerHTML =
-        '<div class="meta"><strong>' + escapeHtml(String(disp)) + "</strong> · " + escapeHtml(when) + "</div>" +
+        '<div class="meta">' + authorNameHtml(row, nameStyle) + " · " + escapeHtml(when) + "</div>" +
         '<div class="att" style="margin-top:8px"><a href="https://discord.com/channels/' +
         escapeHtml(String(row.guild_id || "")) + "/" +
         escapeHtml(String(row.channel_id || "")) + "/" +
@@ -2030,15 +2111,15 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
       div.className = "msg";
       if (row.message_id) div.dataset.mid = String(row.message_id);
       var when = row.created_at_discord ? new Date(row.created_at_discord).toLocaleString() : "";
-      var disp = row.author_display_name || row.author_tag || row.author_username || row.author_id;
-      var nameStyle = displayNameStyle(row.author_roles || []);
+      var rolesArr = normalizeAuthorRoles(row.author_roles);
+      var nameStyle = displayNameStyle(rolesArr);
       div.innerHTML =
         renderReply(row) +
         '<div class="msg-head">' +
           '<img class="av" src="' + escapeHtml(avatarUrl(row)) + '" width="40" height="40" alt="" />' +
           '<div style="min-width:0;flex:1">' +
-            '<div class="meta"><strong style="' + nameStyle + '">' + escapeHtml(String(disp)) + "</strong> · " + escapeHtml(when) + "</div>" +
-            renderRoles(row.author_roles || []) +
+            '<div class="meta">' + authorNameHtml(row, nameStyle) + " · " + escapeHtml(when) + "</div>" +
+            renderRoles(rolesArr) +
           "</div>" +
         "</div>" +
         '<div class="content">' + formatContent(row.content || "") + "</div>" +
@@ -2050,7 +2131,7 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
 
     function renderRoles(roles) {
       if (!Array.isArray(roles) || !roles.length) return "";
-      var PREVIEW = 1;
+      var PREVIEW = 5;
       var previewRoles = roles.slice(0, PREVIEW);
       var out = '<div class="role-row">';
       for (var i = 0; i < previewRoles.length; i++) {
@@ -2073,26 +2154,30 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
     }
 
     function displayNameStyle(roles) {
-      if (!Array.isArray(roles) || !roles.length) return "";
+      if (!Array.isArray(roles) || !roles.length) return "color:#e8eaed";
       for (var i = 0; i < roles.length; i++) {
         var color = roleColorText(roles[i]);
         if (color) return "color:" + color;
       }
-      return "";
+      return "color:#e8eaed";
     }
 
     function rolePillStyle(r) {
-      var color = roleColorText(r);
+      var ro = normalizeRoleObject(r);
+      var color = roleColorText(ro);
       if (!color) return "border-color:#5c6370;color:#b9bbbe;background:rgba(0,0,0,0.22)";
       return "border-color:" + color + ";color:" + color + ";background:rgba(0,0,0,0.28)";
     }
 
     function roleColorText(r) {
-      var c = typeof r?.color === "number" ? r.color : 0;
-      var hex = r?.hexColor;
+      var ro = normalizeRoleObject(r);
+      var hex = ro.hexColor;
       if (hex && hex !== "#000000") return hex;
+      var c = ro.color;
       if (!c) return "";
-      var R = (c >> 16) & 255, G = (c >> 8) & 255, B = c & 255;
+      var R = (c >> 16) & 255,
+        G = (c >> 8) & 255,
+        B = c & 255;
       return "rgb(" + R + "," + G + "," + B + ")";
     }
 
@@ -2441,10 +2526,18 @@ function archivePostHtml(siteBase, user, channelId, messageId, channelTitle) {
       .then(function (j) {
         var row = j.row || {};
         var when = row.created_at_discord ? new Date(row.created_at_discord).toLocaleString() : "";
-        var who = row.author_display_name || row.author_tag || row.author_username || row.author_id || "unknown";
+        var dn = String(row.author_display_name || "").trim();
+        var un = String(row.author_username || "").trim();
+        var tag = String(row.author_tag || "").trim();
+        if (!dn && tag) {
+          var h = tag.indexOf("#");
+          dn = h > 0 ? tag.slice(0, h) : tag;
+        }
+        if (!dn) dn = un || String(row.author_id || "unknown");
+        var at = un && un !== dn ? ' <span style="color:#949ba4;font-size:13px;font-weight:500">@' + esc(un) + "</span>" : "";
         var post = document.getElementById("post");
         post.innerHTML =
-          '<div class="meta"><strong>' + esc(String(who)) + "</strong> · " + esc(when) + "</div>" +
+          '<div class="meta"><strong>' + esc(dn) + "</strong>" + at + " · " + esc(when) + "</div>" +
           '<div><a href="https://discord.com/channels/' + esc(String(row.guild_id || "")) + "/" + esc(String(row.channel_id || "")) + "/" + esc(String(row.message_id || "")) + '" target="_blank" rel="noopener noreferrer">Open original Discord message</a></div>' +
           '<div class="content" style="margin-top:10px">' + format(row.content || "") + "</div>" +
           renderAtt(row.attachments);
