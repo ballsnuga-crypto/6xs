@@ -906,7 +906,7 @@ async function fetchMemberProfileDiscord(bot, guildId, userId) {
     const gid = String(guildId);
     const uid = String(userId);
     const g = await bot.guilds.fetch(gid);
-    const m = await g.members.fetch(uid);
+    const m = await g.members.fetch({ user: uid, force: true });
     const tr = m.roles.highest;
     const topRole =
       tr && tr.id !== g.id && tr.name !== "@everyone"
@@ -916,12 +916,25 @@ async function fetchMemberProfileDiscord(bot, guildId, userId) {
             hex: typeof tr.hexColor === "string" ? tr.hexColor : null,
           }
         : null;
+    const roles = [...m.roles.cache.values()]
+      .filter((r) => String(r.id) !== String(g.id))
+      .sort((a, b) => (b.position || 0) - (a.position || 0))
+      .map((r) => ({
+        id: String(r.id),
+        name: String(r.name || "").slice(0, 80),
+        position: typeof r.position === "number" && Number.isFinite(r.position) ? r.position : 0,
+        color: typeof r.color === "number" ? r.color : 0,
+        hex: typeof r.hexColor === "string" && r.hexColor && r.hexColor.toLowerCase() !== "#000000" ? r.hexColor : null,
+      }));
     return {
       username: m.user.username,
       global_name: m.user.globalName || null,
       display_name: m.displayName,
       avatar_url: m.displayAvatarURL({ size: 256, extension: "png" }),
       top_role: topRole,
+      roles,
+      joined_at: m.joinedAt ? m.joinedAt.toISOString() : null,
+      account_created_at: m.user.createdAt ? m.user.createdAt.toISOString() : null,
     };
   } catch {
     return null;
@@ -938,6 +951,61 @@ function formatProfileDate(iso) {
   }
 }
 
+const DEFAULT_BIO_DISPLAY_SETTINGS = {
+  accent: "#8b5cf6",
+  text: "#fafafa",
+  background: "#09090b",
+  card: "#18181b",
+  border: "#27272a",
+  muted: "#a1a1aa",
+  avatar_blur: 0,
+  avatar_opacity: 100,
+  profile_gradient: false,
+  show_roles: true,
+  show_stats: true,
+  show_bio: true,
+  show_links: true,
+};
+
+function sanitizeBioHex6(val, fallback) {
+  const s = String(val || "").trim();
+  if (/^#[0-9a-fA-F]{6}$/.test(s)) return s;
+  return fallback;
+}
+
+function mergeBioDisplaySettings(raw) {
+  const o = raw && typeof raw === "object" ? raw : {};
+  const out = { ...DEFAULT_BIO_DISPLAY_SETTINGS };
+  out.accent = sanitizeBioHex6(o.accent, out.accent);
+  out.text = sanitizeBioHex6(o.text, out.text);
+  out.background = sanitizeBioHex6(o.background, out.background);
+  out.card = sanitizeBioHex6(o.card, out.card);
+  out.border = sanitizeBioHex6(o.border, out.border);
+  out.muted = sanitizeBioHex6(o.muted, out.muted);
+  out.avatar_blur = Math.min(24, Math.max(0, Math.round(Number(o.avatar_blur) || 0)));
+  out.avatar_opacity = Math.min(100, Math.max(20, Math.round(Number(o.avatar_opacity) || 100)));
+  out.profile_gradient = Boolean(o.profile_gradient);
+  out.show_roles = o.show_roles !== false;
+  out.show_stats = o.show_stats !== false;
+  out.show_bio = o.show_bio !== false;
+  out.show_links = o.show_links !== false;
+  return out;
+}
+
+function bioRolePillStyle(r) {
+  const hx = r?.hex;
+  if (typeof hx === "string" && /^#[0-9a-fA-F]{6}$/i.test(hx) && hx.toLowerCase() !== "#000000") {
+    const c = escapeHtml(hx);
+    return `border-color:${c};color:${c};background:rgba(0,0,0,0.32)`;
+  }
+  const col = Number(r?.color);
+  if (!col) return "border-color:#52525b;color:#e4e4e7;background:rgba(0,0,0,0.32)";
+  const R = (col >> 16) & 255;
+  const G = (col >> 8) & 255;
+  const B = col & 255;
+  return `border-color:rgb(${R},${G},${B});color:rgb(${R},${G},${B});background:rgba(0,0,0,0.32)`;
+}
+
 function bioProfilePageHtml(siteBase, payload) {
   const base = siteBase.replace(/\/$/, "");
   const {
@@ -948,6 +1016,7 @@ function bioProfilePageHtml(siteBase, payload) {
     viewerId,
     profileUrl,
   } = payload;
+  const s = mergeBioDisplaySettings(profile?.display_settings);
   const headline = escapeHtml(
     profile?.profile_display_name ||
       discordMeta?.display_name ||
@@ -963,42 +1032,63 @@ function bioProfilePageHtml(siteBase, payload) {
             : ""),
       )
     : escapeHtml(`@${slug}`);
-  const roleName = profile?.top_role_override
-    ? escapeHtml(profile.top_role_override)
-    : discordMeta?.top_role
-      ? escapeHtml(discordMeta.top_role.name)
-      : "—";
-  let roleColor = "#b5bac1";
-  if (!profile?.top_role_override && discordMeta?.top_role) {
-    const hx = discordMeta.top_role.hex;
-    if (typeof hx === "string" && /^#[0-9a-fA-F]{6}$/.test(hx) && hx.toLowerCase() !== "#000000") {
-      roleColor = hx;
-    } else if (typeof discordMeta.top_role.color === "number" && discordMeta.top_role.color !== 0) {
-      roleColor = `#${discordMeta.top_role.color.toString(16).padStart(6, "0")}`;
-    }
-  }
-  const bioBlock = profile?.bio
-    ? `<div class="bio">${escapeHtml(profile.bio).replace(/\n/g, "<br/>")}</div>`
-    : "";
+  const bioBlock =
+    s.show_bio && profile?.bio
+      ? `<section class="panel"><h2 class="panel-title">About</h2><div class="bio">${escapeHtml(profile.bio).replace(/\n/g, "<br/>")}</div></section>`
+      : "";
   const links = Array.isArray(profile?.links) ? profile.links : [];
   const linksHtml =
-    links.length > 0
-      ? `<div class="links">${links
+    s.show_links && links.length > 0
+      ? `<section class="panel"><h2 class="panel-title">Links</h2><div class="links">${links
           .map(
             (l) =>
-              `<a href="${escapeHtml(l.url)}" rel="noopener noreferrer" target="_blank">${escapeHtml(l.label)}</a>`,
+              `<a class="link-chip" href="${escapeHtml(l.url)}" rel="noopener noreferrer" target="_blank">${escapeHtml(l.label)}</a>`,
           )
-          .join("")}</div>`
+          .join("")}</div></section>`
       : "";
+  const rolesArr = Array.isArray(discordMeta?.roles) ? discordMeta.roles : [];
+  const rolesHtml =
+    s.show_roles && rolesArr.length > 0
+      ? `<section class="panel"><h2 class="panel-title">Server roles</h2>${
+          profile?.top_role_override
+            ? `<p class="tagline">${escapeHtml(profile.top_role_override)}</p>`
+            : ""
+        }<div class="roles-grid">${rolesArr
+          .map(
+            (r) =>
+              `<span class="role-chip" style="${bioRolePillStyle(r)}">${escapeHtml(String(r.name || ""))}</span>`,
+          )
+          .join("")}</div></section>`
+      : s.show_roles && profile?.top_role_override
+        ? `<section class="panel"><h2 class="panel-title">Tag</h2><p class="tagline solo">${escapeHtml(profile.top_role_override)}</p></section>`
+        : "";
   const total = stats?.total ?? 0;
   const span =
     stats?.first_at && stats?.last_at
       ? `${formatProfileDate(stats.first_at)} → ${formatProfileDate(stats.last_at)}`
       : "—";
+  const statJoin = discordMeta?.joined_at ? formatProfileDate(discordMeta.joined_at) : "—";
+  const statAcct = discordMeta?.account_created_at ? formatProfileDate(discordMeta.account_created_at) : "—";
+  const statsHtml = s.show_stats
+    ? `<section class="panel"><h2 class="panel-title">Archive stats</h2><div class="stats">
+        <div class="stat"><b>${escapeHtml(String(total))}</b><span>Archived messages</span></div>
+        <div class="stat"><b>${escapeHtml(span)}</b><span>First → last log</span></div>
+        <div class="stat"><b>${escapeHtml(statJoin)}</b><span>In this server since</span></div>
+        <div class="stat"><b>${escapeHtml(statAcct)}</b><span>Discord account</span></div>
+      </div></section>`
+    : "";
   const canEdit =
     viewerId && profile?.user_id && String(viewerId) === String(profile.user_id);
   const editBtn = canEdit
-    ? `<p class="edit-row"><a class="btn" href="${escapeHtml(base)}/profile/edit">Edit your profile</a></p>`
+    ? `<p class="edit-row"><a class="btn" href="${escapeHtml(base)}/profile/edit">Customize profile</a></p>`
+    : "";
+  const bgLayers = s.profile_gradient
+    ? `linear-gradient(165deg, ${s.accent}33 0%, transparent 42%), radial-gradient(ellipse 90% 55% at 50% -8%, ${s.accent}26, transparent), ${s.background}`
+    : `radial-gradient(ellipse 85% 50% at 50% -12%, ${s.accent}22, transparent), ${s.background}`;
+  const avBlur = Number(s.avatar_blur) || 0;
+  const avOp = (Number(s.avatar_opacity) || 100) / 100;
+  const avatarBlock = discordMeta?.avatar_url
+    ? `<div class="avatar-wrap"><img class="avatar" src="${escapeHtml(discordMeta.avatar_url)}" alt="" style="filter:blur(${avBlur}px);opacity:${avOp};" /></div>`
     : "";
   return `<!DOCTYPE html>
 <html lang="en">
@@ -1007,49 +1097,130 @@ function bioProfilePageHtml(siteBase, payload) {
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>${headline} — 6xs</title>
   <style>
-    :root { --bg:#0c0d10; --card:#14161c; --border:#252830; --text:#e8eaed; --muted:#9aa0a6; --green:#3ba55d; --accent:#5865f2; }
+    :root {
+      --bg: ${s.background};
+      --card: ${s.card};
+      --border: ${s.border};
+      --text: ${s.text};
+      --muted: ${s.muted};
+      --accent: ${s.accent};
+    }
     * { box-sizing: border-box; }
-    body { margin:0; min-height:100vh; font-family:system-ui,sans-serif; background:var(--bg); color:var(--text);
-      padding:24px 16px 48px;
-      background-image: radial-gradient(ellipse 80% 50% at 50% -20%, rgba(88,101,242,0.12), transparent); }
-    .wrap { max-width:520px; margin:0 auto; }
-    .card { background:var(--card); border:1px solid var(--border); border-radius:16px; padding:28px; }
-    .avatar { width:96px; height:96px; border-radius:50%; object-fit:cover; display:block; margin:0 auto 16px; background:#1e2128; }
-    h1 { margin:0 0 6px; font-size:1.45rem; text-align:center; }
-    .userline { text-align:center; color:var(--muted); font-size:14px; margin-bottom:16px; }
-    .role-pill { display:inline-block; margin:0 auto 18px; padding:6px 14px; border-radius:999px; font-size:13px; font-weight:600;
-      border:1px solid ${roleColor}; color:${roleColor}; text-align:center; width:100%; box-sizing:border-box; }
-    .stats { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:18px; }
-    .stat { background:#1e2128; border:1px solid var(--border); border-radius:10px; padding:12px; text-align:center; }
-    .stat b { display:block; font-size:1.25rem; margin-bottom:4px; }
-    .stat span { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:0.04em; }
-    .bio { white-space:pre-wrap; line-height:1.5; color:#d1d3d8; font-size:14px; margin-bottom:14px; }
-    .links { display:flex; flex-wrap:wrap; gap:8px; justify-content:center; margin-bottom:8px; }
-    .links a { color:var(--accent); font-size:14px; font-weight:600; text-decoration:none; }
-    .links a:hover { text-decoration:underline; }
-    .fine { text-align:center; font-size:12px; color:var(--muted); margin-top:20px; }
-    .fine a { color:var(--muted); }
-    .edit-row { text-align:center; margin-top:16px; }
-    .btn { display:inline-block; padding:10px 18px; border-radius:10px; font-weight:600; text-decoration:none; background:var(--accent); color:#fff; font-size:14px; }
-    .btn:hover { filter:brightness(1.08); }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+      background: ${bgLayers};
+      color: var(--text);
+      padding: 28px 16px 56px;
+    }
+    .wrap { max-width: 440px; margin: 0 auto; }
+    .hero {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 28px 22px 22px;
+      box-shadow: 0 24px 48px rgba(0,0,0,0.45);
+    }
+    .avatar-wrap {
+      width: 108px;
+      height: 108px;
+      margin: 0 auto 18px;
+      border-radius: 50%;
+      overflow: hidden;
+      border: 2px solid var(--border);
+      box-shadow: 0 0 0 3px ${s.accent}44, 0 12px 32px rgba(0,0,0,0.35);
+      background: #0c0c0e;
+    }
+    .avatar { width: 100%; height: 100%; object-fit: cover; display: block; transform: scale(1.04); }
+    h1 { margin: 0 0 8px; font-size: 1.55rem; font-weight: 700; text-align: center; letter-spacing: -0.02em; }
+    .userline { text-align: center; color: var(--muted); font-size: 14px; margin-bottom: 8px; }
+    .panel {
+      margin-top: 14px;
+      background: rgba(0,0,0,0.2);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 14px 14px 16px;
+    }
+    .panel-title {
+      margin: 0 0 10px;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      color: var(--muted);
+    }
+    .tagline { margin: 0 0 10px; font-size: 13px; color: var(--muted); font-style: italic; }
+    .tagline.solo { margin: 0; }
+    .roles-grid { display: flex; flex-wrap: wrap; gap: 8px; }
+    .role-chip {
+      font-size: 12px;
+      font-weight: 600;
+      padding: 5px 11px;
+      border-radius: 999px;
+      border: 1px solid;
+      max-width: 100%;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+      overflow: hidden;
+    }
+    .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .stat {
+      background: rgba(0,0,0,0.28);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px 10px;
+      text-align: center;
+    }
+    .stat b { display: block; font-size: 1.1rem; font-weight: 700; margin-bottom: 4px; color: var(--text); }
+    .stat span { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; line-height: 1.35; }
+    .bio { white-space: pre-wrap; line-height: 1.55; color: var(--muted); font-size: 14px; }
+    .links { display: flex; flex-wrap: wrap; gap: 8px; }
+    .link-chip {
+      flex: 1 1 40%;
+      text-align: center;
+      padding: 10px 12px;
+      border-radius: 10px;
+      font-size: 13px;
+      font-weight: 600;
+      text-decoration: none;
+      color: #fff;
+      background: linear-gradient(135deg, var(--accent), ${s.accent}99);
+      border: 1px solid ${s.accent}66;
+      min-width: 0;
+    }
+    .link-chip:hover { filter: brightness(1.1); }
+    .fine { text-align: center; font-size: 12px; color: var(--muted); margin-top: 22px; }
+    .fine a { color: var(--accent); text-decoration: none; }
+    .fine a:hover { text-decoration: underline; }
+    .edit-row { text-align: center; margin-top: 14px; }
+    .btn {
+      display: inline-block;
+      padding: 11px 20px;
+      border-radius: 12px;
+      font-weight: 700;
+      text-decoration: none;
+      background: var(--accent);
+      color: #fff;
+      font-size: 14px;
+      box-shadow: 0 8px 24px ${s.accent}55;
+    }
+    .btn:hover { filter: brightness(1.08); }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <div class="card">
-      ${discordMeta?.avatar_url ? `<img class="avatar" src="${escapeHtml(discordMeta.avatar_url)}" alt="" />` : ""}
+    <div class="hero">
+      ${avatarBlock}
       <h1>${headline}</h1>
       <div class="userline">${userLine}</div>
-      <div class="role-pill">${roleName}</div>
-      <div class="stats">
-        <div class="stat"><b>${escapeHtml(String(total))}</b><span>Archived messages</span></div>
-        <div class="stat"><b>${escapeHtml(span)}</b><span>Archive span</span></div>
-      </div>
+      ${statsHtml}
+      ${rolesHtml}
       ${bioBlock}
       ${linksHtml}
       ${editBtn}
     </div>
-    <p class="fine"><a href="${escapeHtml(base)}">6xs.lol</a> · Profile: <a href="${escapeHtml(profileUrl)}">${escapeHtml(profileUrl.replace(/^https?:\/\//, ""))}</a></p>
+    <p class="fine"><a href="${escapeHtml(base)}">6xs.lol</a> · <a href="${escapeHtml(profileUrl)}">${escapeHtml(profileUrl.replace(/^https?:\/\//, ""))}</a></p>
   </div>
 </body>
 </html>`;
@@ -1062,6 +1233,7 @@ function profileEditPageHtml(siteBase, user, profile, stats, errMsg) {
   const roleOv = escapeHtml(profile?.top_role_override || "");
   const bio = escapeHtml(profile?.bio || "");
   const links = Array.isArray(profile?.links) ? profile.links : [];
+  const theme = mergeBioDisplaySettings(profile?.display_settings);
   const linkRows = [];
   for (let i = 0; i < 5; i++) {
     const L = links[i] || {};
@@ -1074,6 +1246,8 @@ function profileEditPageHtml(siteBase, user, profile, stats, errMsg) {
     stats?.first_at && stats?.last_at
       ? `${formatProfileDate(stats.first_at)} → ${formatProfileDate(stats.last_at)}`
       : "—";
+  const hx = (k) => escapeHtml(theme[k] || "");
+  const chk = (k) => (theme[k] ? "checked" : "");
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1081,18 +1255,29 @@ function profileEditPageHtml(siteBase, user, profile, stats, errMsg) {
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Edit profile — 6xs</title>
   <style>
-    :root { --bg:#0c0d10; --card:#14161c; --border:#252830; --text:#e8eaed; --muted:#9aa0a6; --accent:#5865f2; --err:#ed4245; }
+    :root { --bg:#0c0d10; --card:#14161c; --border:#252830; --text:#e8eaed; --muted:#9aa0a6; --accent:#8b5cf6; --err:#ed4245; }
     * { box-sizing: border-box; }
-    body { margin:0; min-height:100vh; font-family:system-ui,sans-serif; background:var(--bg); color:var(--text); padding:24px 16px 48px; }
-    .wrap { max-width:560px; margin:0 auto; }
+    body { margin:0; min-height:100vh; font-family:ui-sans-serif,system-ui,sans-serif; background:var(--bg); color:var(--text); padding:24px 16px 48px; }
+    .wrap { max-width:620px; margin:0 auto; }
     h1 { font-size:1.35rem; margin:0 0 8px; }
-    p.sub { color:var(--muted); margin:0 0 20px; font-size:14px; }
+    p.sub { color:var(--muted); margin:0 0 20px; font-size:14px; line-height:1.45; }
+    .sec { margin-top:22px; padding-top:18px; border-top:1px solid var(--border); }
+    .sec h2 { font-size:13px; text-transform:uppercase; letter-spacing:0.1em; color:var(--muted); margin:0 0 12px; }
     label { display:block; font-size:12px; color:var(--muted); margin:14px 0 6px; }
     input[type="text"], input[type="url"], textarea {
       width:100%; padding:10px 12px; border-radius:8px; border:1px solid var(--border); background:#1e2128; color:var(--text); font-size:14px; }
     textarea { min-height:120px; resize:vertical; }
+    .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+    .color-row { display:flex; align-items:center; gap:10px; }
+    .color-row input[type="color"] { width:48px; height:40px; border:1px solid var(--border); border-radius:8px; padding:0; cursor:pointer; background:#1e2128; }
+    .color-row input[type="text"] { flex:1; }
+    .row-range { display:flex; align-items:center; gap:12px; }
+    .row-range input[type="range"] { flex:1; }
+    .toggles { display:flex; flex-wrap:wrap; gap:12px 18px; margin-top:8px; font-size:14px; }
+    .toggles label { display:flex; align-items:center; gap:8px; margin:0; cursor:pointer; color:var(--text); }
+    .toggles input { width:18px; height:18px; }
     .link-pair { display:grid; grid-template-columns:1fr 2fr; gap:8px; margin-bottom:8px; }
-    .btn { margin-top:20px; padding:12px 20px; border:none; border-radius:10px; background:var(--accent); color:#fff; font-weight:600; cursor:pointer; font-size:15px; }
+    .btn { margin-top:22px; padding:12px 20px; border:none; border-radius:10px; background:var(--accent); color:#fff; font-weight:600; cursor:pointer; font-size:15px; }
     .btn:hover { filter:brightness(1.08); }
     .err { color:var(--err); font-size:14px; }
     .stats-preview { background:#1e2128; border:1px solid var(--border); border-radius:10px; padding:14px; margin-bottom:20px; font-size:13px; color:var(--muted); }
@@ -1104,25 +1289,72 @@ function profileEditPageHtml(siteBase, user, profile, stats, errMsg) {
 <body>
   <div class="wrap">
     <div class="nav"><a href="${escapeHtml(base)}/archive">← Archives</a> · <a href="${escapeHtml(base)}/${slug}">View profile</a></div>
-    <h1>Edit your 6xs profile</h1>
-    <p class="sub">Signed in as <strong>${escapeHtml(user.global_name || user.username || "")}</strong>. Your public URL is <strong>${escapeHtml(base)}/</strong><span id="slug-preview">${slug}</span></p>
-    <div class="stats-preview">From archives: <strong>${escapeHtml(String(stTotal))}</strong> messages · span <strong>${escapeHtml(stSpan)}</strong> (not editable — synced from archived channels)</div>
+    <h1>Edit your biolink</h1>
+    <p class="sub">Signed in as <strong>${escapeHtml(user.global_name || user.username || "")}</strong>. Public URL: <strong>${escapeHtml(base)}/</strong><span id="slug-preview">${slug}</span><br/>Run <code style="font-size:12px;color:#a1a1aa">supabase_user_bio_migrate.sql</code> in Supabase if theme save errors (adds <code style="font-size:12px">display_settings</code>).</p>
+    <div class="stats-preview">Archive sync: <strong>${escapeHtml(String(stTotal))}</strong> messages · <strong>${escapeHtml(stSpan)}</strong> · All server roles load live from Discord on your public page.</div>
     ${err}
     <form id="pf">
       <label for="slug">URL slug (6xs.lol/…)</label>
       <input id="slug" name="slug" type="text" value="${slug}" maxlength="32" pattern="[a-z0-9_]{3,32}" autocomplete="off" />
-      <label for="profile_display_name">Profile headline (optional)</label>
-      <input id="profile_display_name" name="profile_display_name" type="text" value="${disp}" maxlength="80" placeholder="Defaults to your Discord display name" />
-      <label for="top_role_override">Role line (optional override)</label>
-      <input id="top_role_override" name="top_role_override" type="text" value="${roleOv}" maxlength="80" placeholder="Leave empty to use your top server role" />
-      <label for="bio">Bio</label>
-      <textarea id="bio" name="bio" maxlength="2000" placeholder="Say something…">${bio}</textarea>
-      <label>Links (https only, max 5)</label>
-      ${linkRows.join("")}
-      <button type="submit" class="btn">Save</button>
+      <label for="profile_display_name">Headline (optional)</label>
+      <input id="profile_display_name" name="profile_display_name" type="text" value="${disp}" maxlength="80" placeholder="Defaults to Discord display name" />
+      <label for="top_role_override">Optional tagline above roles</label>
+      <input id="top_role_override" name="top_role_override" type="text" value="${roleOv}" maxlength="80" placeholder="e.g. Host · Designer (shown above role chips)" />
+
+      <div class="sec">
+        <h2>Colors &amp; backdrop</h2>
+        <div class="grid2">
+          <div><label>Accent</label><div class="color-row"><input type="color" id="ts_accent" value="${hx("accent")}" /><input type="text" id="ts_accent_hex" maxlength="7" value="${hx("accent")}" pattern="#[0-9a-fA-F]{6}" /></div></div>
+          <div><label>Text</label><div class="color-row"><input type="color" id="ts_text" value="${hx("text")}" /><input type="text" id="ts_text_hex" maxlength="7" value="${hx("text")}" /></div></div>
+          <div><label>Page background</label><div class="color-row"><input type="color" id="ts_background" value="${hx("background")}" /><input type="text" id="ts_background_hex" maxlength="7" value="${hx("background")}" /></div></div>
+          <div><label>Card / panels</label><div class="color-row"><input type="color" id="ts_card" value="${hx("card")}" /><input type="text" id="ts_card_hex" maxlength="7" value="${hx("card")}" /></div></div>
+          <div><label>Borders</label><div class="color-row"><input type="color" id="ts_border" value="${hx("border")}" /><input type="text" id="ts_border_hex" maxlength="7" value="${hx("border")}" /></div></div>
+          <div><label>Muted text</label><div class="color-row"><input type="color" id="ts_muted" value="${hx("muted")}" /><input type="text" id="ts_muted_hex" maxlength="7" value="${hx("muted")}" /></div></div>
+        </div>
+        <label class="row-range"><span style="min-width:88px;font-size:12px;color:var(--muted)">Avatar blur</span><input type="range" id="ts_avatar_blur" min="0" max="16" value="${escapeHtml(String(theme.avatar_blur))}" /><span id="lbl_blur" style="min-width:28px;text-align:right;font-size:12px;color:var(--muted)">${escapeHtml(String(theme.avatar_blur))}</span></label>
+        <label class="row-range"><span style="min-width:88px;font-size:12px;color:var(--muted)">Avatar opacity</span><input type="range" id="ts_avatar_opacity" min="20" max="100" value="${escapeHtml(String(theme.avatar_opacity))}" /><span id="lbl_op" style="min-width:36px;text-align:right;font-size:12px;color:var(--muted)">${escapeHtml(String(theme.avatar_opacity))}%</span></label>
+        <div class="toggles">
+          <label><input type="checkbox" id="ts_profile_gradient" ${chk("profile_gradient")} /> Violet gradient wash</label>
+          <label><input type="checkbox" id="ts_show_roles" ${chk("show_roles")} /> Show all server roles</label>
+          <label><input type="checkbox" id="ts_show_stats" ${chk("show_stats")} /> Show archive stats</label>
+          <label><input type="checkbox" id="ts_show_bio" ${chk("show_bio")} /> Show bio</label>
+          <label><input type="checkbox" id="ts_show_links" ${chk("show_links")} /> Show links</label>
+        </div>
+      </div>
+
+      <div class="sec">
+        <h2>Content</h2>
+        <label for="bio">Bio</label>
+        <textarea id="bio" name="bio" maxlength="2000" placeholder="Say something…">${bio}</textarea>
+        <label>Links (https only, max 5)</label>
+        ${linkRows.join("")}
+      </div>
+      <button type="submit" class="btn">Save profile</button>
     </form>
   </div>
   <script>
+    function bindColorPair(cId, tId) {
+      var c = document.getElementById(cId);
+      var t = document.getElementById(tId);
+      if (!c || !t) return;
+      c.addEventListener("input", function () { t.value = c.value; });
+      t.addEventListener("input", function () {
+        var v = (t.value || "").trim();
+        if (/^#[0-9a-fA-F]{6}$/.test(v)) c.value = v;
+      });
+    }
+    bindColorPair("ts_accent", "ts_accent_hex");
+    bindColorPair("ts_text", "ts_text_hex");
+    bindColorPair("ts_background", "ts_background_hex");
+    bindColorPair("ts_card", "ts_card_hex");
+    bindColorPair("ts_border", "ts_border_hex");
+    bindColorPair("ts_muted", "ts_muted_hex");
+    document.getElementById("ts_avatar_blur").addEventListener("input", function () {
+      document.getElementById("lbl_blur").textContent = this.value;
+    });
+    document.getElementById("ts_avatar_opacity").addEventListener("input", function () {
+      document.getElementById("lbl_op").textContent = this.value + "%";
+    });
     document.getElementById("slug").addEventListener("input", function () {
       document.getElementById("slug-preview").textContent = (this.value || "").toLowerCase().replace(/[^a-z0-9_]/g, "_").replace(/_+/g, "_").replace(/^_|_$/g, "").slice(0, 32) || "…";
     });
@@ -1134,12 +1366,34 @@ function profileEditPageHtml(siteBase, user, profile, stats, errMsg) {
         var ur = document.querySelector('[name="link_url_' + i + '"]').value.trim();
         if (lb && ur) links.push({ label: lb, url: ur });
       }
+      function pickHex(cId, tId, fallback) {
+        var t = document.getElementById(tId);
+        var v = (t && t.value ? t.value : "").trim();
+        if (/^#[0-9a-fA-F]{6}$/.test(v)) return v;
+        var c = document.getElementById(cId);
+        return c && c.value && /^#[0-9a-fA-F]{6}$/.test(c.value) ? c.value : fallback;
+      }
       const body = {
         slug: document.getElementById("slug").value.trim(),
         profile_display_name: document.getElementById("profile_display_name").value.trim(),
         top_role_override: document.getElementById("top_role_override").value.trim(),
         bio: document.getElementById("bio").value,
         links: links,
+        display_settings: {
+          accent: pickHex("ts_accent", "ts_accent_hex", "#8b5cf6"),
+          text: pickHex("ts_text", "ts_text_hex", "#fafafa"),
+          background: pickHex("ts_background", "ts_background_hex", "#09090b"),
+          card: pickHex("ts_card", "ts_card_hex", "#18181b"),
+          border: pickHex("ts_border", "ts_border_hex", "#27272a"),
+          muted: pickHex("ts_muted", "ts_muted_hex", "#a1a1aa"),
+          avatar_blur: parseInt(document.getElementById("ts_avatar_blur").value, 10) || 0,
+          avatar_opacity: parseInt(document.getElementById("ts_avatar_opacity").value, 10) || 100,
+          profile_gradient: document.getElementById("ts_profile_gradient").checked,
+          show_roles: document.getElementById("ts_show_roles").checked,
+          show_stats: document.getElementById("ts_show_stats").checked,
+          show_bio: document.getElementById("ts_show_bio").checked,
+          show_links: document.getElementById("ts_show_links").checked,
+        },
       };
       try {
         const r = await fetch("/api/profile/me", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -1529,6 +1783,9 @@ function attachArchiveSystem(deps) {
         .trim()
         .slice(0, 80);
       const links = sanitizeProfileLinks(body.links);
+      const display_settings = mergeBioDisplaySettings(
+        body.display_settings && typeof body.display_settings === "object" ? body.display_settings : {},
+      );
       const upd = await supabase
         .from("user_bio_profiles")
         .update({
@@ -1537,6 +1794,7 @@ function attachArchiveSystem(deps) {
           links,
           profile_display_name: profile_display_name || null,
           top_role_override: top_role_override || null,
+          display_settings,
           updated_at: new Date().toISOString(),
         })
         .eq("user_id", String(u.id))
