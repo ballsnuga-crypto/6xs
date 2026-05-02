@@ -965,12 +965,57 @@ const DEFAULT_BIO_DISPLAY_SETTINGS = {
   show_stats: true,
   show_bio: true,
   show_links: true,
+  bg_audio_url: "",
+  bg_video_url: "",
+  bg_overlay_blur: 18,
+  bg_overlay_dim: 0.48,
+  glass_blur: 18,
+  glass_alpha: 0.52,
+  typewriter_bio: false,
+  lanyard_enabled: true,
+  particles: "none",
+  custom_cursor_url: "",
+  clipboard_items: [],
 };
 
 function sanitizeBioHex6(val, fallback) {
   const s = String(val || "").trim();
   if (/^#[0-9a-fA-F]{6}$/.test(s)) return s;
   return fallback;
+}
+
+function sanitizeBiolinkHttpsUrl(val) {
+  const s = String(val || "").trim().slice(0, 900);
+  if (!/^https:\/\//i.test(s)) return "";
+  try {
+    const u = new URL(s);
+    if (u.protocol !== "https:") return "";
+    return s;
+  } catch {
+    return "";
+  }
+}
+
+function sanitizeBiolinkParticles(v) {
+  const m = String(v || "none").toLowerCase();
+  if (["snow", "rain", "stars", "glitch"].includes(m)) return m;
+  return "none";
+}
+
+function sanitizeClipboardItems(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const it of raw.slice(0, 6)) {
+    const label = String(it?.label || "")
+      .trim()
+      .slice(0, 48);
+    const value = String(it?.value || "")
+      .trim()
+      .slice(0, 400);
+    if (!label || !value) continue;
+    out.push({ label, value });
+  }
+  return out;
 }
 
 function mergeBioDisplaySettings(raw) {
@@ -989,6 +1034,19 @@ function mergeBioDisplaySettings(raw) {
   out.show_stats = o.show_stats !== false;
   out.show_bio = o.show_bio !== false;
   out.show_links = o.show_links !== false;
+  out.bg_audio_url = sanitizeBiolinkHttpsUrl(o.bg_audio_url);
+  out.bg_video_url = sanitizeBiolinkHttpsUrl(o.bg_video_url);
+  out.bg_overlay_blur = Math.min(48, Math.max(0, Math.round(Number(o.bg_overlay_blur) || 18)));
+  out.bg_overlay_dim = Math.min(0.92, Math.max(0, Number(o.bg_overlay_dim) || 0.48));
+  if (!Number.isFinite(out.bg_overlay_dim)) out.bg_overlay_dim = 0.48;
+  out.glass_blur = Math.min(48, Math.max(0, Math.round(Number(o.glass_blur) || 16)));
+  out.glass_alpha = Math.min(0.95, Math.max(0.12, Number(o.glass_alpha) || 0.52));
+  if (!Number.isFinite(out.glass_alpha)) out.glass_alpha = 0.52;
+  out.typewriter_bio = Boolean(o.typewriter_bio);
+  out.lanyard_enabled = o.lanyard_enabled !== false;
+  out.particles = sanitizeBiolinkParticles(o.particles);
+  out.custom_cursor_url = sanitizeBiolinkHttpsUrl(o.custom_cursor_url);
+  out.clipboard_items = sanitizeClipboardItems(o.clipboard_items);
   return out;
 }
 
@@ -1004,6 +1062,13 @@ function bioRolePillStyle(r) {
   const G = (col >> 8) & 255;
   const B = col & 255;
   return `border-color:rgb(${R},${G},${B});color:rgb(${R},${G},${B});background:rgba(0,0,0,0.32)`;
+}
+
+function bioCardHexToRgb(hex) {
+  const m = /^#([0-9a-fA-F]{6})$/.exec(String(hex || "").trim());
+  if (!m) return [24, 24, 27];
+  const n = parseInt(m[1], 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
 }
 
 function bioProfilePageHtml(siteBase, payload) {
@@ -1032,9 +1097,22 @@ function bioProfilePageHtml(siteBase, payload) {
             : ""),
       )
     : escapeHtml(`@${slug}`);
+  const rawBio = String(profile?.bio || "");
   const bioBlock =
-    s.show_bio && profile?.bio
-      ? `<section class="panel"><h2 class="panel-title">About</h2><div class="bio">${escapeHtml(profile.bio).replace(/\n/g, "<br/>")}</div></section>`
+    s.show_bio && rawBio
+      ? s.typewriter_bio
+        ? `<section class="panel"><h2 class="panel-title">About</h2><div id="bio-tw" class="bio typewriter" aria-live="polite"></div></section>`
+        : `<section class="panel"><h2 class="panel-title">About</h2><div class="bio">${escapeHtml(rawBio).replace(/\n/g, "<br/>")}</div></section>`
+      : "";
+  const clipItems = Array.isArray(s.clipboard_items) ? s.clipboard_items : [];
+  const clipboardHtml =
+    clipItems.length > 0
+      ? `<section class="panel"><h2 class="panel-title">Clipboard</h2><div class="clip-grid">${clipItems
+          .map(
+            (c, idx) =>
+              `<button type="button" class="clip-row" data-clip-idx="${idx}"><span class="clip-label">${escapeHtml(c.label)}</span><span class="clip-faux">${escapeHtml(c.value.length > 52 ? `${c.value.slice(0, 52)}…` : c.value)}</span><span class="clip-hint">Copy</span></button>`,
+          )
+          .join("")}</div></section>`
       : "";
   const links = Array.isArray(profile?.links) ? profile.links : [];
   const linksHtml =
@@ -1090,6 +1168,33 @@ function bioProfilePageHtml(siteBase, payload) {
   const avatarBlock = discordMeta?.avatar_url
     ? `<div class="avatar-wrap"><img class="avatar" src="${escapeHtml(discordMeta.avatar_url)}" alt="" style="filter:blur(${avBlur}px);opacity:${avOp};" /></div>`
     : "";
+  const hasVideo = Boolean(s.bg_video_url);
+  const cardRgb = bioCardHexToRgb(s.card);
+  const heroGlassBg = `rgba(${cardRgb[0]},${cardRgb[1]},${cardRgb[2]},${Number(s.glass_alpha).toFixed(3)})`;
+  const overlayBlur = Number(s.bg_overlay_blur) || 18;
+  const overlayDim = Number(s.bg_overlay_dim);
+  const overlayDimSafe = Number.isFinite(overlayDim) ? Math.min(0.92, Math.max(0, overlayDim)) : 0.48;
+  const glassBlurPx = Number(s.glass_blur) || 16;
+  const audioHtml = s.bg_audio_url
+    ? `<audio class="biolink-audio" src="${escapeHtml(s.bg_audio_url)}" loop playsinline preload="auto"></audio><p class="audio-hint" id="audio-hint">Tap anywhere to start background audio</p>`
+    : "";
+  const videoHtml = hasVideo
+    ? `<video class="biolink-bgvid" muted loop playsinline autoplay disablepictureinpicture><source src="${escapeHtml(s.bg_video_url)}" /></video><div class="biolink-overlay" style="backdrop-filter:blur(${overlayBlur}px);-webkit-backdrop-filter:blur(${overlayBlur}px);background:rgba(0,0,0,${overlayDimSafe.toFixed(3)});"></div>`
+    : "";
+  const cursorCss = s.custom_cursor_url
+    ? `cursor:url("${String(s.custom_cursor_url).replace(/"/g, "")}") 0 0, auto;`
+    : "";
+  const bodyBgStyle = hasVideo ? "#030303" : bgLayers;
+  const bootPayload = {
+    bio: rawBio,
+    uid: String(profile?.user_id || ""),
+    tw: Boolean(s.typewriter_bio && rawBio.length),
+    lanyard: Boolean(s.lanyard_enabled && profile?.user_id),
+    particles: s.particles || "none",
+    audio: Boolean(s.bg_audio_url),
+    clip: clipItems,
+  };
+  const bootJson = JSON.stringify(bootPayload).replace(/</g, "\\u003c");
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1106,21 +1211,77 @@ function bioProfilePageHtml(siteBase, payload) {
       --accent: ${s.accent};
     }
     * { box-sizing: border-box; }
-    body {
+    .biolink-bgvid {
+      position: fixed;
+      inset: 0;
+      z-index: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      pointer-events: none;
+    }
+    .biolink-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 1;
+      pointer-events: none;
+    }
+    .biolink-pcanvas {
+      position: fixed;
+      inset: 0;
+      z-index: 2;
+      pointer-events: none;
+    }
+    .biolink-audio {
+      position: absolute;
+      width: 0;
+      height: 0;
+      opacity: 0;
+      pointer-events: none;
+    }
+    .audio-hint {
+      position: fixed;
+      bottom: 12px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 8;
+      font-size: 11px;
+      color: var(--muted);
+      opacity: 0.85;
+      pointer-events: none;
+      max-width: 90vw;
+      text-align: center;
+      transition: opacity 0.4s;
+    }
+    .audio-hint.done { opacity: 0; }
+    body.biolink-page {
       margin: 0;
       min-height: 100vh;
       font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-      background: ${bgLayers};
+      background: ${bodyBgStyle};
       color: var(--text);
       padding: 28px 16px 56px;
+      ${cursorCss}
     }
-    .wrap { max-width: 440px; margin: 0 auto; }
+    body.biolink-has-video { background: ${bodyBgStyle} !important; }
+    .wrap {
+      position: relative;
+      z-index: 3;
+      max-width: 440px;
+      margin: 0 auto;
+    }
     .hero {
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 20px;
+      background: ${heroGlassBg};
+      backdrop-filter: blur(${glassBlurPx}px);
+      -webkit-backdrop-filter: blur(${glassBlurPx}px);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 22px;
       padding: 28px 22px 22px;
-      box-shadow: 0 24px 48px rgba(0,0,0,0.45);
+      box-shadow: 0 24px 64px rgba(0,0,0,0.55), inset 0 1px 0 rgba(255,255,255,0.06);
+    }
+    @keyframes biolink-avatar-glow {
+      0%, 100% { box-shadow: 0 0 0 3px ${s.accent}55, 0 10px 36px rgba(0,0,0,0.45); }
+      50% { box-shadow: 0 0 0 5px ${s.accent}88, 0 14px 48px ${s.accent}33; }
     }
     .avatar-wrap {
       width: 108px;
@@ -1128,17 +1289,26 @@ function bioProfilePageHtml(siteBase, payload) {
       margin: 0 auto 18px;
       border-radius: 50%;
       overflow: hidden;
-      border: 2px solid var(--border);
-      box-shadow: 0 0 0 3px ${s.accent}44, 0 12px 32px rgba(0,0,0,0.35);
+      border: 2px solid rgba(255,255,255,0.1);
+      animation: biolink-avatar-glow 3.2s ease-in-out infinite;
       background: #0c0c0e;
     }
     .avatar { width: 100%; height: 100%; object-fit: cover; display: block; transform: scale(1.04); }
     h1 { margin: 0 0 8px; font-size: 1.55rem; font-weight: 700; text-align: center; letter-spacing: -0.02em; }
-    .userline { text-align: center; color: var(--muted); font-size: 14px; margin-bottom: 8px; }
+    .userline { text-align: center; color: var(--muted); font-size: 14px; margin-bottom: 6px; }
+    .identity-strip { text-align: center; margin-bottom: 10px; min-height: 28px; }
+    .badge-row { display: inline-flex; flex-wrap: wrap; gap: 6px; justify-content: center; align-items: center; margin-bottom: 6px; }
+    .badge-row svg { width: 22px; height: 22px; opacity: 0.95; }
+    .presence-row { font-size: 12px; color: var(--muted); line-height: 1.4; }
+    .presence-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+    .presence-dot.online { background: #3ba55d; box-shadow: 0 0 10px #3ba55d; }
+    .presence-dot.idle { background: #faa61a; }
+    .presence-dot.dnd { background: #ed4245; }
+    .presence-dot.offline { background: #747f8d; }
     .panel {
       margin-top: 14px;
-      background: rgba(0,0,0,0.2);
-      border: 1px solid var(--border);
+      background: rgba(0,0,0,0.18);
+      border: 1px solid rgba(255,255,255,0.06);
       border-radius: 14px;
       padding: 14px 14px 16px;
     }
@@ -1174,7 +1344,30 @@ function bioProfilePageHtml(siteBase, payload) {
     }
     .stat b { display: block; font-size: 1.1rem; font-weight: 700; margin-bottom: 4px; color: var(--text); }
     .stat span { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; line-height: 1.35; }
-    .bio { white-space: pre-wrap; line-height: 1.55; color: var(--muted); font-size: 14px; }
+    .bio { white-space: pre-wrap; line-height: 1.55; color: var(--muted); font-size: 14px; min-height: 1.2em; }
+    .bio.typewriter::after { content: "▍"; animation: blink 0.9s step-end infinite; color: var(--accent); margin-left: 1px; }
+    @keyframes blink { 50% { opacity: 0; } }
+    .clip-grid { display: flex; flex-direction: column; gap: 8px; }
+    .clip-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+      width: 100%;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: rgba(0,0,0,0.25);
+      color: var(--text);
+      font: inherit;
+      cursor: pointer;
+      text-align: left;
+      transition: border-color 0.2s, box-shadow 0.2s, transform 0.15s;
+    }
+    .clip-row:hover { border-color: var(--accent); box-shadow: 0 0 0 1px ${s.accent}44; transform: translateY(-1px); }
+    .clip-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); flex: 0 0 100%; }
+    .clip-faux { font-size: 12px; color: var(--text); word-break: break-all; flex: 1; min-width: 0; }
+    .clip-hint { font-size: 11px; color: var(--accent); font-weight: 600; }
     .links { display: flex; flex-wrap: wrap; gap: 8px; }
     .link-chip {
       flex: 1 1 40%;
@@ -1188,9 +1381,14 @@ function bioProfilePageHtml(siteBase, payload) {
       background: linear-gradient(135deg, var(--accent), ${s.accent}99);
       border: 1px solid ${s.accent}66;
       min-width: 0;
+      transition: transform 0.2s, box-shadow 0.2s, filter 0.2s;
     }
-    .link-chip:hover { filter: brightness(1.1); }
-    .fine { text-align: center; font-size: 12px; color: var(--muted); margin-top: 22px; }
+    .link-chip:hover {
+      transform: translateY(-3px) scale(1.03);
+      box-shadow: 0 12px 28px ${s.accent}55, 0 0 24px ${s.accent}44;
+      filter: brightness(1.08);
+    }
+    .fine { text-align: center; font-size: 12px; color: var(--muted); margin-top: 22px; position: relative; z-index: 3; }
     .fine a { color: var(--accent); text-decoration: none; }
     .fine a:hover { text-decoration: underline; }
     .edit-row { text-align: center; margin-top: 14px; }
@@ -1208,20 +1406,194 @@ function bioProfilePageHtml(siteBase, payload) {
     .btn:hover { filter: brightness(1.08); }
   </style>
 </head>
-<body>
+<body class="biolink-page${hasVideo ? " biolink-has-video" : ""}">
+  ${audioHtml}
+  ${videoHtml}
+  <canvas id="biolink-pcanvas" class="biolink-pcanvas" aria-hidden="true"></canvas>
+  <script type="application/json" id="biolink-boot">${bootJson}</script>
   <div class="wrap">
     <div class="hero">
       ${avatarBlock}
       <h1>${headline}</h1>
       <div class="userline">${userLine}</div>
+      <div class="identity-strip">
+        <div id="badge-row" class="badge-row"></div>
+        <div id="presence-row" class="presence-row"></div>
+      </div>
       ${statsHtml}
       ${rolesHtml}
       ${bioBlock}
+      ${clipboardHtml}
       ${linksHtml}
       ${editBtn}
     </div>
     <p class="fine"><a href="${escapeHtml(base)}">6xs.lol</a> · <a href="${escapeHtml(profileUrl)}">${escapeHtml(profileUrl.replace(/^https?:\/\//, ""))}</a></p>
   </div>
+  <script>
+(function () {
+  var el = document.getElementById("biolink-boot");
+  if (!el) return;
+  var BOOT = {};
+  try { BOOT = JSON.parse(el.textContent || "{}"); } catch (e) { return; }
+  function typewriter() {
+    if (!BOOT.tw) return;
+    var node = document.getElementById("bio-tw");
+    if (!node || !BOOT.bio) return;
+    var text = BOOT.bio;
+    var i = 0;
+    function tick() {
+      if (i <= text.length) {
+        node.textContent = text.slice(0, i);
+        i++;
+        setTimeout(tick, i > 2 && text[i - 2] === "." ? 120 : 28);
+      } else node.classList.remove("typewriter");
+    }
+    tick();
+  }
+  typewriter();
+  function playAudioOnce() {
+    var a = document.querySelector(".biolink-audio");
+    var h = document.getElementById("audio-hint");
+    if (!a) return;
+    a.volume = 0.35;
+    a.play().then(function () { if (h) h.classList.add("done"); }).catch(function () {});
+    document.removeEventListener("click", playAudioOnce);
+    document.removeEventListener("touchstart", playAudioOnce);
+  }
+  if (BOOT.audio) {
+    document.addEventListener("click", playAudioOnce);
+    document.addEventListener("touchstart", playAudioOnce, { passive: true });
+  }
+  function copyFromIdx(idx) {
+    var arr = BOOT.clip || [];
+    if (!arr[idx]) return;
+    var v = arr[idx].value;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(v).then(function () {}).catch(function () {});
+    }
+  }
+  document.querySelectorAll(".clip-row").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var i = parseInt(btn.getAttribute("data-clip-idx"), 10);
+      if (!isNaN(i)) copyFromIdx(i);
+    });
+  });
+  var FLAG_SVG = {
+    staff: '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2L2 7l10 5 10-5-10-5zm0 9l2.5-1.25L12 8.5l-2.5 1.25L12 11zm0 2.5l-5-2.5-5 2.5L12 22l10-8.5-5-2.5-5 2.5z"/></svg>',
+    partner: '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="#5865F2" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>',
+    hype: '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="#F47B67" d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>',
+    nitro: '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="#FF73FA" d="M4 4h16v4l-8 5v7l-3-2v-5L4 8V4z"/></svg>',
+    early: '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="#F0B232" d="M12 2L4 9v13h16V9l-8-7zm0 3.17L16.17 10H7.83L12 5.17zM18 19H6v-7h12v7z"/></svg>',
+    dev: '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="#3BA55D" d="M9.4 16.6L4.8 12l4.6-4.6L8 6l-6 6 6 6 1.4-1.4zm5.2 0l4.6-4.6-4.6-4.6L16 6l6 6-6 6-1.4-1.4z"/></svg>'
+  };
+  function flagBadges(flags) {
+    var html = "";
+    if (!flags) return html;
+    if (flags & 1) html += FLAG_SVG.staff;
+    if (flags & 1 << 1) html += FLAG_SVG.partner;
+    if (flags & (1 << 3)) html += FLAG_SVG.dev;
+    if (flags & (1 << 9)) html += FLAG_SVG.early;
+    if (flags & ((1 << 6) | (1 << 7) | (1 << 8))) html += FLAG_SVG.hype;
+    return html;
+  }
+  function esc(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/"/g, "&quot;");
+  }
+  function lanyard() {
+    if (!BOOT.lanyard || !BOOT.uid) return;
+    fetch("https://api.lanyard.rest/v1/users/" + encodeURIComponent(BOOT.uid))
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (!j || !j.success || !j.data) return;
+        var d = j.data;
+        var br = document.getElementById("badge-row");
+        var pr = document.getElementById("presence-row");
+        if (br && d.discord_user) {
+          var f = d.discord_user.public_flags || 0;
+          var extra = "";
+          if (d.discord_user.premium_type > 0) extra += FLAG_SVG.nitro;
+          br.innerHTML = flagBadges(f) + extra;
+        }
+        if (pr) {
+          var stRaw = d.discord_status || "offline";
+          var st = ["online", "idle", "dnd", "offline"].indexOf(stRaw) >= 0 ? stRaw : "offline";
+          var dot = '<span class="presence-dot ' + st + '"></span>';
+          var act = (d.activities && d.activities[0] && d.activities[0].name) ? d.activities[0].name : "";
+          var det = (d.activities && d.activities[0] && d.activities[0].details) ? " — " + d.activities[0].details : "";
+          var line = act ? "Playing " + esc(act) + esc(det) : "Discord · " + esc(stRaw);
+          pr.innerHTML = dot + '<span style="vertical-align:middle">' + line + "</span>";
+        }
+      })
+      .catch(function () {});
+  }
+  lanyard();
+  var cv = document.getElementById("biolink-pcanvas");
+  if (cv && BOOT.particles && BOOT.particles !== "none") {
+    var ctx = cv.getContext("2d");
+    var W, H, parts = [];
+    function resize() {
+      W = cv.width = innerWidth;
+      H = cv.height = innerHeight;
+    }
+    resize();
+    addEventListener("resize", resize);
+    var n = BOOT.particles === "stars" ? 90 : BOOT.particles === "glitch" ? 40 : 70;
+    for (var i = 0; i < n; i++) {
+      parts.push({
+        x: Math.random() * W,
+        y: Math.random() * H,
+        s: Math.random() * 2.2 + 0.3,
+        v: Math.random() * 1.5 + 0.4,
+        vx: (Math.random() - 0.5) * (BOOT.particles === "glitch" ? 3 : 0.2),
+      });
+    }
+    function tick() {
+      ctx.clearRect(0, 0, W, H);
+      for (var i = 0; i < parts.length; i++) {
+        var p = parts[i];
+        if (BOOT.particles === "rain") {
+          ctx.fillStyle = "rgba(200,220,255,0.45)";
+          p.y += p.v * 6;
+          p.x += p.vx;
+          if (p.y > H) { p.y = -4; p.x = Math.random() * W; }
+          ctx.fillRect(p.x, p.y, 1.2, p.s * 10);
+        } else if (BOOT.particles === "snow") {
+          ctx.fillStyle = "rgba(255,255,255,0.5)";
+          p.y += p.v * 0.8;
+          p.x += Math.sin(p.y * 0.02) * 0.8;
+          if (p.y > H) { p.y = -2; p.x = Math.random() * W; }
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, p.s, 0, 6.28);
+          ctx.fill();
+        } else if (BOOT.particles === "stars") {
+          p.tw = (p.tw || Math.random() * 10) + 0.04;
+          var o = 0.25 + Math.sin(p.tw) * 0.35;
+          ctx.globalAlpha = o;
+          ctx.fillStyle = "rgba(255,255,255,0.9)";
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, p.s, 0, 6.28);
+          ctx.fill();
+          ctx.globalAlpha = 1;
+        } else {
+          ctx.fillStyle = Math.random() > 0.5 ? "rgba(255,0,255,0.2)" : "rgba(0,255,255,0.18)";
+          p.x += (Math.random() - 0.5) * 10;
+          p.y += (Math.random() - 0.5) * 8;
+          if (p.x < 0) p.x = W;
+          if (p.x > W) p.x = 0;
+          if (p.y < 0) p.y = H;
+          if (p.y > H) p.y = 0;
+          ctx.fillRect(p.x, p.y, 2, 12);
+        }
+      }
+      requestAnimationFrame(tick);
+    }
+    tick();
+  }
+})();
+  </script>
 </body>
 </html>`;
 }
@@ -1240,6 +1612,17 @@ function profileEditPageHtml(siteBase, user, profile, stats, errMsg) {
     linkRows.push(`<div class="link-pair"><input name="link_label_${i}" type="text" placeholder="Label" value="${escapeHtml(L.label || "")}" maxlength="60" />
       <input name="link_url_${i}" type="url" placeholder="https://…" value="${escapeHtml(L.url || "")}" /></div>`);
   }
+  const clipItems = Array.isArray(theme.clipboard_items) ? theme.clipboard_items : [];
+  const clipRows = [];
+  for (let i = 0; i < 5; i++) {
+    const C = clipItems[i] || {};
+    clipRows.push(`<div class="link-pair"><input name="clip_label_${i}" type="text" placeholder="Label" value="${escapeHtml(C.label || "")}" maxlength="48" />
+      <input name="clip_value_${i}" type="text" placeholder="Value to copy" value="${escapeHtml(C.value || "")}" maxlength="400" /></div>`);
+  }
+  const particlePresets = ["none", "snow", "rain", "stars", "glitch"];
+  const particleOpts = particlePresets
+    .map((p) => `<option value="${p}"${theme.particles === p ? " selected" : ""}>${p}</option>`)
+    .join("");
   const err = errMsg ? `<p class="err">${escapeHtml(errMsg)}</p>` : "";
   const stTotal = stats?.total ?? 0;
   const stSpan =
@@ -1323,6 +1706,28 @@ function profileEditPageHtml(siteBase, user, profile, stats, errMsg) {
       </div>
 
       <div class="sec">
+        <h2>Immersive &amp; motion</h2>
+        <label for="ts_bg_video">Background video (https — fullscreen, muted, loop)</label>
+        <input id="ts_bg_video" type="url" placeholder="https://cdn…/loop.mp4" value="${escapeHtml(theme.bg_video_url || "")}" maxlength="900" />
+        <label for="ts_bg_audio">Background audio (https mp3 — loops after first tap)</label>
+        <input id="ts_bg_audio" type="url" placeholder="https://…/track.mp3" value="${escapeHtml(theme.bg_audio_url || "")}" maxlength="900" />
+        <label for="ts_cursor_url">Custom cursor (https .png or .cur)</label>
+        <input id="ts_cursor_url" type="url" placeholder="https://…/cursor.png" value="${escapeHtml(theme.custom_cursor_url || "")}" maxlength="900" />
+        <label class="row-range"><span style="min-width:128px;font-size:12px;color:var(--muted)">Video backdrop blur</span><input type="range" id="ts_overlay_blur" min="0" max="40" value="${escapeHtml(String(theme.bg_overlay_blur))}" /><span id="lbl_ob" style="min-width:32px;text-align:right;font-size:12px;color:var(--muted)">${escapeHtml(String(theme.bg_overlay_blur))}</span></label>
+        <label class="row-range"><span style="min-width:128px;font-size:12px;color:var(--muted)">Video dim overlay</span><input type="range" id="ts_overlay_dim" min="0" max="90" value="${escapeHtml(String(Math.round(Number(theme.bg_overlay_dim) * 100)))}" /><span id="lbl_od" style="min-width:36px;text-align:right;font-size:12px;color:var(--muted)">${escapeHtml(String(Math.round(Number(theme.bg_overlay_dim) * 100)))}%</span></label>
+        <label class="row-range"><span style="min-width:128px;font-size:12px;color:var(--muted)">Glass card blur</span><input type="range" id="ts_glass_blur" min="4" max="40" value="${escapeHtml(String(theme.glass_blur))}" /><span id="lbl_gb" style="min-width:32px;text-align:right;font-size:12px;color:var(--muted)">${escapeHtml(String(theme.glass_blur))}</span></label>
+        <label class="row-range"><span style="min-width:128px;font-size:12px;color:var(--muted)">Glass card opacity</span><input type="range" id="ts_glass_alpha" min="12" max="95" value="${escapeHtml(String(Math.round(Number(theme.glass_alpha) * 100)))}" /><span id="lbl_ga" style="min-width:36px;text-align:right;font-size:12px;color:var(--muted)">${escapeHtml(String(Math.round(Number(theme.glass_alpha) * 100)))}%</span></label>
+        <label for="ts_particles">Particles (canvas overlay)</label>
+        <select id="ts_particles">${particleOpts}</select>
+        <div class="toggles" style="margin-top:12px">
+          <label><input type="checkbox" id="ts_typewriter_bio" ${theme.typewriter_bio ? "checked" : ""} /> Typewriter bio</label>
+          <label><input type="checkbox" id="ts_lanyard_enabled" ${theme.lanyard_enabled !== false ? "checked" : ""} /> Lanyard presence &amp; badges</label>
+        </div>
+        <label style="margin-top:14px">Clipboard (optional — tap to copy on public page)</label>
+        ${clipRows.join("")}
+      </div>
+
+      <div class="sec">
         <h2>Content</h2>
         <label for="bio">Bio</label>
         <textarea id="bio" name="bio" maxlength="2000" placeholder="Say something…">${bio}</textarea>
@@ -1355,6 +1760,18 @@ function profileEditPageHtml(siteBase, user, profile, stats, errMsg) {
     document.getElementById("ts_avatar_opacity").addEventListener("input", function () {
       document.getElementById("lbl_op").textContent = this.value + "%";
     });
+    function bindLbl(id, lbl) {
+      var el = document.getElementById(id);
+      var l = document.getElementById(lbl);
+      if (!el || !l) return;
+      el.addEventListener("input", function () {
+        l.textContent = id === "ts_overlay_dim" || id === "ts_glass_alpha" ? this.value + "%" : this.value;
+      });
+    }
+    bindLbl("ts_overlay_blur", "lbl_ob");
+    bindLbl("ts_overlay_dim", "lbl_od");
+    bindLbl("ts_glass_blur", "lbl_gb");
+    bindLbl("ts_glass_alpha", "lbl_ga");
     document.getElementById("slug").addEventListener("input", function () {
       document.getElementById("slug-preview").textContent = (this.value || "").toLowerCase().replace(/[^a-z0-9_]/g, "_").replace(/_+/g, "_").replace(/^_|_$/g, "").slice(0, 32) || "…";
     });
@@ -1365,6 +1782,12 @@ function profileEditPageHtml(siteBase, user, profile, stats, errMsg) {
         var lb = document.querySelector('[name="link_label_' + i + '"]').value.trim();
         var ur = document.querySelector('[name="link_url_' + i + '"]').value.trim();
         if (lb && ur) links.push({ label: lb, url: ur });
+      }
+      const clip = [];
+      for (var j = 0; j < 5; j++) {
+        var cl = document.querySelector('[name="clip_label_' + j + '"]').value.trim();
+        var cv = document.querySelector('[name="clip_value_' + j + '"]').value.trim();
+        if (cl && cv) clip.push({ label: cl, value: cv });
       }
       function pickHex(cId, tId, fallback) {
         var t = document.getElementById(tId);
@@ -1393,6 +1816,17 @@ function profileEditPageHtml(siteBase, user, profile, stats, errMsg) {
           show_stats: document.getElementById("ts_show_stats").checked,
           show_bio: document.getElementById("ts_show_bio").checked,
           show_links: document.getElementById("ts_show_links").checked,
+          bg_video_url: document.getElementById("ts_bg_video").value.trim(),
+          bg_audio_url: document.getElementById("ts_bg_audio").value.trim(),
+          custom_cursor_url: document.getElementById("ts_cursor_url").value.trim(),
+          bg_overlay_blur: parseInt(document.getElementById("ts_overlay_blur").value, 10) || 0,
+          bg_overlay_dim: (parseInt(document.getElementById("ts_overlay_dim").value, 10) || 0) / 100,
+          glass_blur: parseInt(document.getElementById("ts_glass_blur").value, 10) || 16,
+          glass_alpha: (parseInt(document.getElementById("ts_glass_alpha").value, 10) || 52) / 100,
+          particles: document.getElementById("ts_particles").value,
+          typewriter_bio: document.getElementById("ts_typewriter_bio").checked,
+          lanyard_enabled: document.getElementById("ts_lanyard_enabled").checked,
+          clipboard_items: clip,
         },
       };
       try {
