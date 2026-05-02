@@ -411,6 +411,33 @@ function buildAuthorRolesSnapshot(member, guildSnowflakeId) {
   }
 }
 
+/** Fetches missing Role objects into guild cache so member.roles.cache is complete (common on messageCreate). */
+async function resolveAuthorRolesForInsert(member, guild) {
+  if (!member || !guild) return [];
+  let snap = buildAuthorRolesSnapshot(member, guild.id);
+  if (snap.length > 0) return snap;
+  const ids = Array.isArray(member._roles) ? member._roles.map(String) : [];
+  const want = ids.filter((id) => id && id !== String(guild.id));
+  if (want.length === 0) return [];
+  for (const rid of want.slice(0, 24)) {
+    if (!guild.roles.cache.has(rid)) {
+      try {
+        await guild.roles.fetch(rid);
+      } catch {
+        /* role deleted or no access */
+      }
+    }
+  }
+  snap = buildAuthorRolesSnapshot(member, guild.id);
+  if (snap.length > 0) return snap;
+  try {
+    await guild.roles.fetch();
+  } catch {
+    /* ignore */
+  }
+  return buildAuthorRolesSnapshot(member, guild.id);
+}
+
 async function logAccess(supabase, req, discordUserId, path, note) {
   const xf = req.headers["x-forwarded-for"];
   const ip = (typeof xf === "string" ? xf.split(",")[0] : "")?.trim() || req.socket?.remoteAddress || "";
@@ -475,21 +502,7 @@ async function insertArchiveMessage(supabase, message, mediaCfg = null) {
   }
 
   const mentionUserIds = extractMentionUserIds(message);
-  let authorRoles = buildAuthorRolesSnapshot(member, message.guild?.id);
-  const memberRoleIds = member?._roles;
-  if (
-    authorRoles.length === 0 &&
-    message.guild &&
-    Array.isArray(memberRoleIds) &&
-    memberRoleIds.length > 0
-  ) {
-    try {
-      await message.guild.roles.fetch();
-      authorRoles = buildAuthorRolesSnapshot(member, message.guild.id);
-    } catch {
-      /* roles cache may still be incomplete */
-    }
-  }
+  const authorRoles = await resolveAuthorRolesForInsert(member, message.guild);
 
   const attachments = [];
   if (message.attachments?.size) {
@@ -541,7 +554,7 @@ async function insertArchiveMessage(supabase, message, mediaCfg = null) {
   const author = message.author;
   const authorDisplayName =
     member?.displayName || author?.globalName || author?.username || null;
-  const row = {
+  let working = {
     channel_id: String(message.channelId),
     message_id: String(message.id),
     guild_id: String(message.guildId),
@@ -563,50 +576,51 @@ async function insertArchiveMessage(supabase, message, mediaCfg = null) {
     reply_to_content,
     created_at_discord: message.createdAt?.toISOString() || new Date().toISOString(),
   };
-  let { error } = await supabase.from("archive_messages").upsert(row, {
+  let { error } = await supabase.from("archive_messages").upsert(working, {
     onConflict: "channel_id,message_id",
   });
   if (error && String(error.message || "").includes("stickers")) {
-    const rowNoStickers = { ...row };
-    delete rowNoStickers.stickers;
-    ({ error } = await supabase.from("archive_messages").upsert(rowNoStickers, {
+    delete working.stickers;
+    ({ error } = await supabase.from("archive_messages").upsert(working, {
       onConflict: "channel_id,message_id",
     }));
   }
   if (error && String(error.message || "").includes("author_avatar_hash")) {
-    const rowMinimal = {
-      channel_id: row.channel_id,
-      message_id: row.message_id,
-      guild_id: row.guild_id,
-      author_id: row.author_id,
-      author_tag: row.author_tag,
-      author_display_name: row.author_display_name,
-      author_is_bot: row.author_is_bot,
-      content: row.content,
-      attachments: row.attachments,
-      embeds: row.embeds,
-      reply_to_message_id: row.reply_to_message_id,
-      reply_to_author_id: row.reply_to_author_id,
-      reply_to_author_tag: row.reply_to_author_tag,
-      reply_to_content: row.reply_to_content,
-      created_at_discord: row.created_at_discord,
-    };
-    ({ error } = await supabase.from("archive_messages").upsert(rowMinimal, {
+    delete working.author_avatar_hash;
+    ({ error } = await supabase.from("archive_messages").upsert(working, {
       onConflict: "channel_id,message_id",
     }));
   }
-  if (error && /author_roles|mention_user_ids|reply_to_|author_display_name/i.test(String(error.message || ""))) {
-    const rowNoMeta = { ...row };
-    delete rowNoMeta.author_roles;
-    delete rowNoMeta.mention_user_ids;
-    delete rowNoMeta.author_display_name;
-    delete rowNoMeta.reply_to_message_id;
-    delete rowNoMeta.reply_to_author_id;
-    delete rowNoMeta.reply_to_author_tag;
-    delete rowNoMeta.reply_to_content;
-    ({ error } = await supabase.from("archive_messages").upsert(rowNoMeta, {
-      onConflict: "channel_id,message_id",
-    }));
+  if (error) {
+    const em = String(error.message || "");
+    if (/author_roles|mention_user_ids|reply_to_|author_display_name/i.test(em)) {
+      const rowNoMeta = { ...working };
+      let stripped = false;
+      if (/author_roles/i.test(em)) {
+        delete rowNoMeta.author_roles;
+        stripped = true;
+      }
+      if (/mention_user_ids/i.test(em)) {
+        delete rowNoMeta.mention_user_ids;
+        stripped = true;
+      }
+      if (/author_display_name/i.test(em)) {
+        delete rowNoMeta.author_display_name;
+        stripped = true;
+      }
+      if (/reply_to_message_id|reply_to_author|reply_to_content/i.test(em)) {
+        delete rowNoMeta.reply_to_message_id;
+        delete rowNoMeta.reply_to_author_id;
+        delete rowNoMeta.reply_to_author_tag;
+        delete rowNoMeta.reply_to_content;
+        stripped = true;
+      }
+      if (stripped) {
+        ({ error } = await supabase.from("archive_messages").upsert(rowNoMeta, {
+          onConflict: "channel_id,message_id",
+        }));
+      }
+    }
   }
   if (error) console.warn("[archive] log message failed:", error.message);
 }
@@ -2188,16 +2202,62 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
       return "border-color:" + color + ";color:" + color + ";background:rgba(0,0,0,0.28)";
     }
 
+    function _roleLinRGB(R, G, B) {
+      function lin(x) {
+        x /= 255;
+        return x <= 0.03928 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4);
+      }
+      var r = lin(R),
+        g = lin(G),
+        b = lin(B);
+      return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    }
+
+    function _roleRelLumHex(hex) {
+      var s = String(hex || "").trim();
+      var m3 = /^#([0-9a-f]{3})$/i.exec(s);
+      if (m3) {
+        var t = m3[1];
+        return _roleLinRGB(
+          parseInt(t[0] + t[0], 16),
+          parseInt(t[1] + t[1], 16),
+          parseInt(t[2] + t[2], 16),
+        );
+      }
+      var m6 = /^#([0-9a-f]{6})$/i.exec(s);
+      if (!m6) return 1;
+      var n = parseInt(m6[1], 16);
+      return _roleLinRGB((n >> 16) & 255, (n >> 8) & 255, n & 255);
+    }
+
+    /** Skip near-black / very dark role colors on dark archive UI (name + pills fall back to readable neutrals). */
+    function _roleTooDarkForArchiveUI(css) {
+      if (!css) return true;
+      if (/^#/i.test(String(css))) return _roleRelLumHex(css) < 0.22;
+      var s = String(css).trim().toLowerCase();
+      if (!s.startsWith("rgb(")) return false;
+      var inner = s.slice(4, s.lastIndexOf(")"));
+      var parts = inner.split(",");
+      if (parts.length !== 3) return false;
+      var R = parseInt(parts[0], 10),
+        G = parseInt(parts[1], 10),
+        B = parseInt(parts[2], 10);
+      if (!Number.isFinite(R) || !Number.isFinite(G) || !Number.isFinite(B)) return false;
+      return _roleLinRGB(R, G, B) < 0.22;
+    }
+
     function roleColorText(r) {
       var ro = normalizeRoleObject(r);
       var hex = ro.hexColor;
-      if (hex && hex !== "#000000") return hex;
+      if (hex && hex !== "#000000" && !_roleTooDarkForArchiveUI(hex)) return hex;
       var c = ro.color;
       if (!c) return "";
       var R = (c >> 16) & 255,
         G = (c >> 8) & 255,
         B = c & 255;
-      return "rgb(" + R + "," + G + "," + B + ")";
+      var rgb = "rgb(" + R + "," + G + "," + B + ")";
+      if (_roleTooDarkForArchiveUI(rgb)) return "";
+      return rgb;
     }
 
     function encodeRolesData(roles) {
