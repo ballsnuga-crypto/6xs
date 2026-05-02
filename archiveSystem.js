@@ -400,6 +400,7 @@ function buildAuthorRolesSnapshot(member, guildSnowflakeId) {
       .map((r) => ({
         id: String(r.id),
         name: String(r.name || "").slice(0, 80),
+        position: typeof r.position === "number" && Number.isFinite(r.position) ? r.position : 0,
         color: typeof r.color === "number" ? r.color : 0,
         hexColor:
           typeof r.hexColor === "string" && r.hexColor !== "#000000"
@@ -2061,7 +2062,7 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
       return out;
     }
     function normalizeRoleObject(r) {
-      if (!r || typeof r !== "object") return { id: "", name: "", color: 0, hexColor: null };
+      if (!r || typeof r !== "object") return { id: "", name: "", position: 0, color: 0, hexColor: null };
       var c = r.color;
       if (typeof c === "string") {
         var cs = c.trim();
@@ -2069,14 +2070,51 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
       } else if (typeof c !== "number" || !Number.isFinite(c)) {
         c = 0;
       }
+      var pos = r.position;
+      if (typeof pos === "string") {
+        var ps = pos.trim();
+        pos = /^-?\\d+$/.test(ps) ? parseInt(ps, 10) : 0;
+      } else if (typeof pos !== "number" || !Number.isFinite(pos)) {
+        pos = 0;
+      }
       var hx = r.hexColor || r.hex_color || null;
       if (typeof hx !== "string" || hx === "#000000") hx = null;
       return {
         id: String(r.id != null ? r.id : ""),
         name: String(r.name != null ? r.name : "").slice(0, 80),
+        position: pos,
         color: c,
         hexColor: hx,
       };
+    }
+
+    function sortRolesByPositionDesc(roles) {
+      if (!Array.isArray(roles) || !roles.length) return [];
+      var a = [];
+      for (var si = 0; si < roles.length; si++) a.push(normalizeRoleObject(roles[si]));
+      a.sort(function (x, y) {
+        return (y.position || 0) - (x.position || 0);
+      });
+      return a;
+    }
+
+    function roleHasDyeColor(ro) {
+      var o = normalizeRoleObject(ro);
+      if (o.hexColor && o.hexColor !== "#000000") return true;
+      return typeof o.color === "number" && o.color !== 0;
+    }
+
+    /** Discord-style name color: highest-position role that actually carries a color (no luminance clamp — matches client). */
+    function roleColorTextForDisplayName(ro) {
+      var o = normalizeRoleObject(ro);
+      var hex = o.hexColor;
+      if (hex && hex !== "#000000") return hex;
+      var c = o.color;
+      if (!c) return "";
+      var R = (c >> 16) & 255,
+        G = (c >> 8) & 255,
+        B = c & 255;
+      return "rgb(" + R + "," + G + "," + B + ")";
     }
     function formatAuthorDisplayParts(row) {
       var dn = String(row.author_display_name || "").trim();
@@ -2164,22 +2202,23 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
 
     function renderRoles(roles) {
       if (!Array.isArray(roles) || !roles.length) return "";
-      var PREVIEW = 5;
-      var previewRoles = roles.slice(0, PREVIEW);
+      var PREVIEW = 1;
+      var sorted = sortRolesByPositionDesc(roles);
+      var previewRoles = sorted.slice(0, PREVIEW);
       var out = '<div class="role-row">';
       for (var i = 0; i < previewRoles.length; i++) {
         var r = previewRoles[i];
         var st = rolePillStyle(r);
         out += '<span class="role-pill" style="' + st + '">' + escapeHtml(r.name || "") + "</span>";
       }
-      if (roles.length > PREVIEW) {
+      if (sorted.length > PREVIEW) {
         out +=
           '<button type="button" class="role-toggle" data-state="collapsed" data-preview="' +
           String(PREVIEW) +
           '" data-roles="' +
-          encodeRolesData(roles) +
+          encodeRolesData(sorted) +
           '">View all (' +
-          String(roles.length) +
+          String(sorted.length) +
           ")</button>";
       }
       out += "</div>";
@@ -2188,8 +2227,10 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
 
     function displayNameStyle(roles) {
       if (!Array.isArray(roles) || !roles.length) return "color:#e8eaed";
-      for (var i = 0; i < roles.length; i++) {
-        var color = roleColorText(roles[i]);
+      var sorted = sortRolesByPositionDesc(roles);
+      for (var i = 0; i < sorted.length; i++) {
+        if (!roleHasDyeColor(sorted[i])) continue;
+        var color = roleColorTextForDisplayName(sorted[i]);
         if (color) return "color:" + color;
       }
       return "color:#e8eaed";
@@ -2437,7 +2478,7 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
       if (!rt) return;
       var allRoles = decodeRolesData(rt.dataset.roles);
       if (!allRoles.length) return;
-      var previewCount = Math.max(1, parseInt(rt.dataset.preview || "5", 10) || 5);
+      var previewCount = Math.max(1, parseInt(rt.dataset.preview || "1", 10) || 1);
       var expanded = rt.dataset.state === "expanded";
       var row = rt.closest(".role-row");
       if (!row) return;
