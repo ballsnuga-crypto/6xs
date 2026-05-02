@@ -439,12 +439,20 @@ function replyPreviewFromMessage(refMsg) {
 }
 
 async function insertArchiveMessage(supabase, message, mediaCfg = null) {
-  let member = message.member;
-  if (!member && message.guild && message.author?.id) {
+  /** Always prefer a REST refresh: cached members skip the API without `force`, so `_roles` can stay stale on messageCreate. */
+  let member = null;
+  if (message.guild && message.author?.id) {
     try {
-      member = await message.guild.members.fetch(message.author.id);
+      member = await message.guild.members.fetch({ user: message.author.id, force: true });
     } catch {
-      member = null;
+      member = message.member;
+      if (!member) {
+        try {
+          member = await message.guild.members.fetch({ user: message.author.id });
+        } catch {
+          member = null;
+        }
+      }
     }
   }
 
@@ -467,7 +475,21 @@ async function insertArchiveMessage(supabase, message, mediaCfg = null) {
   }
 
   const mentionUserIds = extractMentionUserIds(message);
-  const authorRoles = buildAuthorRolesSnapshot(member, message.guild?.id);
+  let authorRoles = buildAuthorRolesSnapshot(member, message.guild?.id);
+  const memberRoleIds = member?._roles;
+  if (
+    authorRoles.length === 0 &&
+    message.guild &&
+    Array.isArray(memberRoleIds) &&
+    memberRoleIds.length > 0
+  ) {
+    try {
+      await message.guild.roles.fetch();
+      authorRoles = buildAuthorRolesSnapshot(member, message.guild.id);
+    } catch {
+      /* roles cache may still be incomplete */
+    }
+  }
 
   const attachments = [];
   if (message.attachments?.size) {
@@ -518,10 +540,7 @@ async function insertArchiveMessage(supabase, message, mediaCfg = null) {
       : [];
   const author = message.author;
   const authorDisplayName =
-    message.member?.displayName ||
-    author?.globalName ||
-    author?.username ||
-    null;
+    member?.displayName || author?.globalName || author?.username || null;
   const row = {
     channel_id: String(message.channelId),
     message_id: String(message.id),
