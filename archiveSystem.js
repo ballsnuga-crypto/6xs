@@ -68,7 +68,27 @@ function rowHasMedia(row) {
   return false;
 }
 
-/** #tcc / #blood — auto post link + `6vid` random archived video (CDN). */
+/** Stickers, image/video attachments, or embeds with image/video/thumbnail (same rules as archive “media”). */
+function discordMessageHasArchivableMedia(message) {
+  try {
+    if (message.stickers?.size) return true;
+    if (message.attachments?.size) {
+      for (const a of message.attachments.values()) {
+        if (attachmentLooksMedia(a)) return true;
+      }
+    }
+    if (message.embeds?.size) {
+      for (const e of message.embeds.values()) {
+        if (e.image?.url || e.thumbnail?.url || e.video?.url) return true;
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return false;
+}
+
+/** #tcc / #blood — media-only archive + post permalink + `6vid`. */
 const ARCHIVE_POSTLINK_6VID_CHANNEL_IDS = new Set(["1498278738096295936", "1498521334198702223"]);
 
 function archiveAttachmentIsVideo(a) {
@@ -2374,6 +2394,11 @@ function attachArchiveSystem(deps) {
     }
 
     if (!ARCHIVE_CHANNEL_IDS.includes(chId)) return;
+
+    if (ARCHIVE_POSTLINK_6VID_CHANNEL_IDS.has(chId) && !discordMessageHasArchivableMedia(message)) {
+      return;
+    }
+
     await insertArchiveMessage(supabase, message, mediaBackupCfg);
 
     if (!message.author.bot && ARCHIVE_POSTLINK_6VID_CHANNEL_IDS.has(chId)) {
