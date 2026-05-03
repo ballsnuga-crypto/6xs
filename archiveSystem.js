@@ -65,6 +65,12 @@ function rowHasMedia(row) {
   for (const a of attachments) {
     if (attachmentLooksMedia(a)) return true;
   }
+  const stickers = Array.isArray(row?.stickers) ? row.stickers : [];
+  if (stickers.length) return true;
+  const embeds = Array.isArray(row?.embeds) ? row.embeds : [];
+  for (const e of embeds) {
+    if (e?.image?.url || e?.thumbnail?.url || e?.video?.url) return true;
+  }
   return false;
 }
 
@@ -109,7 +115,15 @@ function archiveVideoUrlFromAttachment(a) {
  * Scan recent archive rows for video attachments; returns { url, messageId } or null.
  * Rewrites Supabase → site CDN via normalizeArchiveMessageRow.
  */
-async function pickRandomArchivedVideoFromChannel(supabase, channelId, cdnBase, bucket, maxRows = 4000) {
+async function pickRandomArchivedVideoFromChannel(
+  supabase,
+  channelId,
+  cdnBase,
+  bucket,
+  excludeMessageIds = null,
+  maxRows = 12000,
+) {
+  const exclude = excludeMessageIds instanceof Set ? excludeMessageIds : new Set();
   const page = 200;
   const pool = [];
   for (let offset = 0; offset < maxRows; offset += page) {
@@ -123,12 +137,14 @@ async function pickRandomArchivedVideoFromChannel(supabase, channelId, cdnBase, 
     const rows = data || [];
     if (!rows.length) break;
     for (const row of rows) {
+      const mid = String(row.message_id || "");
+      if (exclude.has(mid)) continue;
       const norm = normalizeArchiveMessageRow(row, cdnBase, bucket);
       const ats = Array.isArray(norm.attachments) ? norm.attachments : [];
       for (const a of ats) {
         if (!archiveAttachmentIsVideo(a)) continue;
         const u = archiveVideoUrlFromAttachment(a);
-        if (u) pool.push({ url: u, messageId: String(row.message_id || "") });
+        if (u) pool.push({ url: u, messageId: mid });
       }
     }
     if (rows.length < page) break;
@@ -137,24 +153,69 @@ async function pickRandomArchivedVideoFromChannel(supabase, channelId, cdnBase, 
   return pool[Math.floor(Math.random() * pool.length)];
 }
 
+/** Parse archive post message IDs from this bot's recent replies (6vid + post links) so 6vid avoids repeats. */
+async function collectArchivePostIdsFromRecentBotMessages(channel, channelId, siteBase, fetchLimit = 100) {
+  const ids = new Set();
+  if (!channel?.messages?.fetch) return ids;
+  const base = String(siteBase || "").replace(/\/$/, "");
+  const needles = [`${base}/archive/post/${channelId}/`, `/archive/post/${channelId}/`];
+  function harvest(text) {
+    const s = String(text || "");
+    for (const n of needles) {
+      let i = 0;
+      while ((i = s.indexOf(n, i)) !== -1) {
+        const start = i + n.length;
+        const m = s.slice(start).match(/^(\d{17,22})/);
+        if (m) ids.add(m[1]);
+        i = start;
+      }
+    }
+  }
+  const batch = await channel.messages.fetch({ limit: fetchLimit }).catch(() => null);
+  if (!batch) return ids;
+  const selfId = channel.client?.user?.id ? String(channel.client.user.id) : "";
+  for (const m of batch.values()) {
+    if (!m.author?.bot) continue;
+    if (selfId && String(m.author.id) !== selfId) continue;
+    harvest(m.content);
+    for (const e of m.embeds || []) {
+      harvest(e.description);
+      harvest(e.title);
+      harvest(e.url);
+      harvest(e.footer?.text);
+    }
+    for (const row of m.components || []) {
+      for (const c of row.components || []) {
+        if (c.url) harvest(String(c.url));
+      }
+    }
+  }
+  return ids;
+}
+
 async function replyArchive6vidCommand(message, supabase, cdnBase, bucket, siteBase, channelId) {
-  const pick = await pickRandomArchivedVideoFromChannel(supabase, channelId, cdnBase, bucket);
+  const exclude = await collectArchivePostIdsFromRecentBotMessages(message.channel, channelId, siteBase);
+  const pick = await pickRandomArchivedVideoFromChannel(supabase, channelId, cdnBase, bucket, exclude);
   const base = String(siteBase || "").replace(/\/$/, "");
   if (!pick?.url || !pick.messageId) {
     await message.reply({
       content:
-        "No archived **videos** in this channel yet (or they were logged before media mirroring). Try again after more video posts are archived.",
+        "No archived **video** to show, or every clip was already linked in my recent replies in this channel—post more video or try again later.",
     });
     return;
   }
   const postUrl = `${base}/archive/post/${encodeURIComponent(String(channelId))}/${encodeURIComponent(pick.messageId)}`;
   const embed = new EmbedBuilder()
     .setColor(0x8b5cf6)
-    .setTitle("Random archived video")
+    .setURL(postUrl)
+    .setTitle("Random archived video — watch")
     .setDescription(
-      `**CDN (6xs):** [open clip](${pick.url})\n**Archive post:** [open page](${postUrl})`,
+      "Use **Watch on site** for the full player (photos + video). **Direct video** opens the mirrored file.",
     );
-  await message.reply({ embeds: [embed] });
+  const watchBtn = new ButtonBuilder().setLabel("Watch on site").setStyle(ButtonStyle.Link).setURL(postUrl);
+  const directBtn = new ButtonBuilder().setLabel("Direct video").setStyle(ButtonStyle.Link).setURL(pick.url);
+  const row = new ActionRowBuilder().addComponents(watchBtn, directBtn);
+  await message.reply({ embeds: [embed], components: [row] });
 }
 
 function safeStorageName(s) {
@@ -2090,7 +2151,13 @@ function attachArchiveSystem(deps) {
   app.get("/archive", requireArchiveMember, async (req, res) => {
     const u = req.session.archiveUser;
     const labels = CHANNEL_LABELS || {};
-    res.type("html").send(archiveShellHtml(SITE_BASE, u, ARCHIVE_CHANNEL_IDS, labels, mediaChannelId));
+    res
+      .type("html")
+      .send(
+        archiveShellHtml(SITE_BASE, u, ARCHIVE_CHANNEL_IDS, labels, mediaChannelId, [
+          ...ARCHIVE_POSTLINK_6VID_CHANNEL_IDS,
+        ]),
+      );
   });
 
   app.get("/casino", requireArchiveMember, async (req, res) => {
@@ -2191,37 +2258,41 @@ function attachArchiveSystem(deps) {
     if (!ARCHIVE_CHANNEL_IDS.includes(channelId)) return res.status(404).json({ error: "unknown channel" });
 
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || "40", 10) || 40));
-    const offset = Math.max(0, parseInt(req.query.offset || "0", 10) || 0);
     const hideBots = String(req.query.hide_bots || "") === "1";
+    const beforeRaw = String(req.query.before_message_id || "").trim();
+    const scanLt = /^\d{17,22}$/.test(beforeRaw) ? beforeRaw : null;
 
-    const rows = [];
-    let cursor = offset;
-    let hasMore = false;
-    for (let guard = 0; guard < 12 && rows.length < limit; guard++) {
-      const { data, error } = await supabase
+    const out = [];
+    let pageCursor = scanLt;
+    for (let guard = 0; guard < 200 && out.length < limit; guard++) {
+      let qb = supabase
         .from("archive_messages")
         .select("*")
         .eq("channel_id", channelId)
-        .order("created_at_discord", { ascending: false })
-        .range(cursor, cursor + 199);
+        .order("message_id", { ascending: false })
+        .limit(200);
+      if (pageCursor) qb = qb.lt("message_id", pageCursor);
+      const { data, error } = await qb;
       if (error) return res.status(500).json({ error: error.message });
       const chunk = data || [];
       if (!chunk.length) break;
       for (const row of chunk) {
         if (hideBots && row.author_is_bot) continue;
-        if (rowHasMedia(row)) rows.push(row);
-        if (rows.length >= limit) break;
+        if (!rowHasMedia(row)) continue;
+        if (out.length < limit) out.push(row);
       }
-      cursor += chunk.length;
+      pageCursor = String(chunk[chunk.length - 1].message_id || "");
       if (chunk.length < 200) break;
-      hasMore = true;
+      if (out.length >= limit) break;
     }
+
+    const nextBeforeMessageId = out.length >= limit && pageCursor ? pageCursor : null;
     res.json({
-      rows: rows.slice(0, limit).map((r) => normalizeArchiveMessageRow(r, mediaCdnBase, mediaBackupCfg.bucket)),
+      rows: out.map((r) => normalizeArchiveMessageRow(r, mediaCdnBase, mediaBackupCfg.bucket)),
       total: null,
       limit,
-      offset,
-      has_more: hasMore || rows.length >= limit,
+      next_before_message_id: nextBeforeMessageId,
+      has_more: Boolean(nextBeforeMessageId),
     });
   });
 
@@ -2604,10 +2675,17 @@ function pageNotInGuild(siteBase) {
 </body></html>`;
 }
 
-function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
+function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId, mediaTabChannelIds = null) {
   const channelsJson = JSON.stringify(channelIds);
   const labelsJson = JSON.stringify(labels);
   const mediaChannelJson = JSON.stringify(String(mediaChannelId || ""));
+  const tabIds =
+    Array.isArray(mediaTabChannelIds) && mediaTabChannelIds.length
+      ? mediaTabChannelIds.map(String)
+      : mediaChannelId
+        ? [String(mediaChannelId)]
+        : [];
+  const mediaTabChannelIdsJson = JSON.stringify(tabIds);
   const name = escapeHtml(user.global_name || user.username || "member");
   return `<!DOCTYPE html>
 <html lang="en">
@@ -2709,10 +2787,12 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
     const CHANNEL_IDS = ${channelsJson};
     const LABELS = ${labelsJson};
     const MEDIA_CHANNEL_ID = ${mediaChannelJson};
+    const MEDIA_TAB_CHANNEL_IDS = new Set(${mediaTabChannelIdsJson});
     const PAGE = 40;
     let active = CHANNEL_IDS[0] || "";
     let viewMode = "messages";
     let offset = 0;
+    let mediaBeforeMessageId = null;
     let loading = false;
     let exhausted = false;
     let totalKnown = null;
@@ -2734,7 +2814,7 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
       b.onclick = () => {
         active = id;
         // Always default to chat view when selecting a channel tab.
-        // Blood channel still has a separate Media tab, but it won't open media-only by default.
+        // #tcc / #blood: Media tab (not default); Chats stays default.
         viewMode = "messages";
         [...tabs.querySelectorAll("button")].forEach((x) => x.classList.toggle("active", x.dataset.id === active));
         syncModeButtons();
@@ -2744,7 +2824,7 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
     });
 
     function syncModeButtons() {
-      var isMediaChannel = active === MEDIA_CHANNEL_ID;
+      var isMediaChannel = MEDIA_TAB_CHANNEL_IDS.has(active);
       modeRow.style.display = isMediaChannel ? "flex" : "none";
       document.getElementById("mode-messages").classList.toggle("active", viewMode === "messages");
       document.getElementById("mode-media").classList.toggle("active", viewMode === "media");
@@ -2753,7 +2833,11 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
     function queryParams() {
       const p = new URLSearchParams();
       p.set("limit", String(PAGE));
-      p.set("offset", String(offset));
+      if (viewMode === "media" && mediaBeforeMessageId) {
+        p.set("before_message_id", String(mediaBeforeMessageId));
+      } else {
+        p.set("offset", String(offset));
+      }
       var q = document.getElementById("f-q").value.trim();
       var aid = document.getElementById("f-author-id").value.trim();
       var an = document.getElementById("f-author").value.trim();
@@ -2778,6 +2862,7 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
 
     function resetAndLoad() {
       offset = 0;
+      mediaBeforeMessageId = null;
       exhausted = false;
       totalKnown = null;
       feed.innerHTML = '<p class="loading">Loading…</p>';
@@ -2798,13 +2883,17 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
           return;
         }
         const j = await r.json();
-        if (typeof j.total === "number") totalKnown = j.total;
+        if (viewMode !== "media" && typeof j.total === "number") totalKnown = j.total;
+        if (viewMode === "media") totalKnown = null;
         var rows = j.rows || [];
 
         if (isFirst) {
           feed.innerHTML = "";
           if (!rows.length) {
-            feed.innerHTML = '<p class="loading">No messages match (or nothing logged yet).</p>';
+            feed.innerHTML =
+              '<p class="loading">' +
+              (viewMode === "media" ? "No media in archive yet." : "No messages match (or nothing logged yet).") +
+              "</p>";
             exhausted = true;
             updateStats(0);
             loading = false;
@@ -2816,7 +2905,11 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
           exhausted = true;
           updateStats(feed.querySelectorAll(".msg").length);
           sentinelMsg.textContent =
-            totalKnown != null ? "End of archive · " + totalKnown + " messages matched" : "End of archive";
+            viewMode === "media"
+              ? "End of media archive"
+              : totalKnown != null
+                ? "End of archive · " + totalKnown + " messages matched"
+                : "End of archive";
           sentinelMsg.style.display = "block";
           return;
         }
@@ -2825,14 +2918,22 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
           feed.appendChild(viewMode === "media" ? renderMediaCard(rows[i]) : renderMessage(rows[i]));
         }
 
-        offset += rows.length;
-        if (rows.length < PAGE) exhausted = true;
+        if (viewMode === "media") {
+          mediaBeforeMessageId = j.next_before_message_id || null;
+          if (!rows.length || !j.next_before_message_id) exhausted = true;
+        } else {
+          offset += rows.length;
+          if (rows.length < PAGE) exhausted = true;
+        }
 
         updateStats(feed.querySelectorAll(".msg").length);
         if (exhausted) {
-          sentinelMsg.textContent = totalKnown != null
-            ? "End of archive · " + totalKnown + " messages matched"
-            : "End of archive";
+          sentinelMsg.textContent =
+            viewMode === "media"
+              ? "End of media archive"
+              : totalKnown != null
+                ? "End of archive · " + totalKnown + " messages matched"
+                : "End of archive";
           sentinelMsg.style.display = "block";
           sentinelMsg.classList.add("done");
         }
@@ -2943,12 +3044,28 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
       return '<strong style="' + nameStyle + '">' + escapeHtml(p.display) + "</strong>" + at;
     }
 
+    function renderEmbedMediaPreviews(embeds) {
+      if (!Array.isArray(embeds) || !embeds.length) return "";
+      var h = "";
+      for (var ei = 0; ei < embeds.length; ei++) {
+        var e = embeds[ei] || {};
+        var u = (e.image && e.image.url) || (e.thumbnail && e.thumbnail.url) || (e.video && e.video.url) || "";
+        if (!u) continue;
+        h += '<div class="att"><img src="' + escapeHtml(u) + '" alt="" loading="lazy" /></div>';
+      }
+      return h;
+    }
+
     function renderMediaCard(row) {
       var div = document.createElement("div");
       div.className = "msg";
       var when = row.created_at_discord ? new Date(row.created_at_discord).toLocaleString() : "";
       var nameStyle = displayNameStyle(normalizeAuthorRoles(row.author_roles));
       var body = renderAttachments(row.attachments);
+      var st = renderStickers(row.stickers);
+      if (st) body += st;
+      var emb = renderEmbedMediaPreviews(row.embeds);
+      if (emb) body += emb;
       if (!body) body = '<div class="content">' + formatContent(row.content || "") + "</div>";
       var sitePost =
         "/archive/post/" + encodeURIComponent(String(row.channel_id || "")) + "/" + encodeURIComponent(String(row.message_id || ""));
@@ -3165,14 +3282,16 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId) {
         var ct = String(a.contentType || a.content_type || "").toLowerCase();
         var name = a.name || "attachment";
         if (!url) continue;
-        if (ct.indexOf("image/") === 0) {
+        var isImg = ct.indexOf("image/") === 0 || (!ct && /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(name));
+        var isVid = ct.indexOf("video/") === 0 || (!ct && /\.(mp4|webm|mov|m4v|mkv|avi)$/i.test(name));
+        if (isImg) {
           html +=
             '<div class="att"><img src="' +
             escapeHtml(url) +
             '" alt="" loading="lazy" data-alt-urls="' +
             escapeHtml(alt) +
             '" data-fallback-idx="0" onerror="archiveMediaFallback(this)" /></div>';
-        } else if (ct.indexOf("video/") === 0) {
+        } else if (isVid) {
           html +=
             '<div class="att"><video controls preload="metadata" src="' +
             escapeHtml(url) +
