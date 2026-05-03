@@ -205,17 +205,16 @@ async function replyArchive6vidCommand(message, supabase, cdnBase, bucket, siteB
     return;
   }
   const postUrl = `${base}/archive/post/${encodeURIComponent(String(channelId))}/${encodeURIComponent(pick.messageId)}`;
+  /** Raw CDN URL in `content` so Discord can play the video inline; embed + button for the site mirror. */
   const embed = new EmbedBuilder()
     .setColor(0x8b5cf6)
     .setURL(postUrl)
-    .setTitle("Random archived video — watch")
-    .setDescription(
-      "Use **Watch on site** for the full player (photos + video). **Direct video** opens the mirrored file.",
-    );
-  const watchBtn = new ButtonBuilder().setLabel("Watch on site").setStyle(ButtonStyle.Link).setURL(postUrl);
-  const directBtn = new ButtonBuilder().setLabel("Direct video").setStyle(ButtonStyle.Link).setURL(pick.url);
-  const row = new ActionRowBuilder().addComponents(watchBtn, directBtn);
-  await message.reply({ embeds: [embed], components: [row] });
+    .setTitle("Archive page (full post)")
+    .setDescription("Clip plays inline from the link above — use the button if you prefer the web player.");
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setLabel("Watch on site").setStyle(ButtonStyle.Link).setURL(postUrl),
+  );
+  await message.reply({ content: pick.url, embeds: [embed], components: [row] });
 }
 
 function safeStorageName(s) {
