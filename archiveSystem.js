@@ -205,16 +205,9 @@ async function replyArchive6vidCommand(message, supabase, cdnBase, bucket, siteB
     return;
   }
   const postUrl = `${base}/archive/post/${encodeURIComponent(String(channelId))}/${encodeURIComponent(pick.messageId)}`;
-  /** Raw CDN URL in `content` so Discord can play the video inline; embed + button for the site mirror. */
-  const embed = new EmbedBuilder()
-    .setColor(0x8b5cf6)
-    .setURL(postUrl)
-    .setTitle("Archive page (full post)")
-    .setDescription("Clip plays inline from the link above — use the button if you prefer the web player.");
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setLabel("Watch on site").setStyle(ButtonStyle.Link).setURL(postUrl),
-  );
-  await message.reply({ content: pick.url, embeds: [embed], components: [row] });
+  /** Video-only message so Discord can embed/play the MP4; site link is a separate reply. */
+  await message.reply({ content: pick.url });
+  await message.reply({ content: `View the full post on the site: ${postUrl}` });
 }
 
 function safeStorageName(s) {
