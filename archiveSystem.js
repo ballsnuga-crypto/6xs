@@ -68,6 +68,75 @@ function rowHasMedia(row) {
   return false;
 }
 
+/** #tcc / #blood — auto post link + `6vid` random archived video (CDN). */
+const ARCHIVE_POSTLINK_6VID_CHANNEL_IDS = new Set(["1498278738096295936", "1498521334198702223"]);
+
+function archiveAttachmentIsVideo(a) {
+  const ct = String(a?.contentType || a?.content_type || "").toLowerCase();
+  const name = String(a?.name || "").toLowerCase();
+  if (ct.startsWith("video/")) return true;
+  return /\.(mp4|webm|mov|m4v|mkv|avi)$/i.test(name);
+}
+
+/** Prefer mirrored CDN URL after normalizeArchiveMessageRow. */
+function archiveVideoUrlFromAttachment(a) {
+  const url = String(a?.mirroredUrl || a?.mirrored_url || a?.proxyUrl || a?.proxy_url || a?.url || "").trim();
+  if (!/^https:\/\//i.test(url)) return null;
+  return url;
+}
+
+/**
+ * Scan recent archive rows for video attachments; returns { url, messageId } or null.
+ * Rewrites Supabase → site CDN via normalizeArchiveMessageRow.
+ */
+async function pickRandomArchivedVideoFromChannel(supabase, channelId, cdnBase, bucket, maxRows = 4000) {
+  const page = 200;
+  const pool = [];
+  for (let offset = 0; offset < maxRows; offset += page) {
+    const { data, error } = await supabase
+      .from("archive_messages")
+      .select("attachments,message_id")
+      .eq("channel_id", String(channelId))
+      .order("created_at_discord", { ascending: false })
+      .range(offset, offset + page - 1);
+    if (error) throw error;
+    const rows = data || [];
+    if (!rows.length) break;
+    for (const row of rows) {
+      const norm = normalizeArchiveMessageRow(row, cdnBase, bucket);
+      const ats = Array.isArray(norm.attachments) ? norm.attachments : [];
+      for (const a of ats) {
+        if (!archiveAttachmentIsVideo(a)) continue;
+        const u = archiveVideoUrlFromAttachment(a);
+        if (u) pool.push({ url: u, messageId: String(row.message_id || "") });
+      }
+    }
+    if (rows.length < page) break;
+  }
+  if (!pool.length) return null;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+async function replyArchive6vidCommand(message, supabase, cdnBase, bucket, siteBase, channelId) {
+  const pick = await pickRandomArchivedVideoFromChannel(supabase, channelId, cdnBase, bucket);
+  const base = String(siteBase || "").replace(/\/$/, "");
+  if (!pick?.url || !pick.messageId) {
+    await message.reply({
+      content:
+        "No archived **videos** in this channel yet (or they were logged before media mirroring). Try again after more video posts are archived.",
+    });
+    return;
+  }
+  const postUrl = `${base}/archive/post/${encodeURIComponent(String(channelId))}/${encodeURIComponent(pick.messageId)}`;
+  const embed = new EmbedBuilder()
+    .setColor(0x8b5cf6)
+    .setTitle("Random archived video")
+    .setDescription(
+      `**CDN (6xs):** [open clip](${pick.url})\n**Archive post:** [open page](${postUrl})`,
+    );
+  await message.reply({ embeds: [embed] });
+}
+
 function safeStorageName(s) {
   return String(s || "")
     .replace(/[^a-zA-Z0-9._-]/g, "_")
@@ -2291,8 +2360,31 @@ function attachArchiveSystem(deps) {
 
   bot.on("messageCreate", async (message) => {
     if (!message.guild) return;
-    if (!ARCHIVE_CHANNEL_IDS.includes(String(message.channelId))) return;
+    const chId = String(message.channelId);
+    const firstWord = (message.content || "").trim().split(/\s+/)[0]?.toLowerCase() || "";
+
+    if (!message.author.bot && ARCHIVE_POSTLINK_6VID_CHANNEL_IDS.has(chId) && firstWord === "6vid") {
+      try {
+        await replyArchive6vidCommand(message, supabase, mediaCdnBase, mediaBackupCfg.bucket, SITE_BASE, chId);
+      } catch (e) {
+        console.warn("[6vid]", e.message);
+        await message.reply("Couldn’t load a video from the archive right now.").catch(() => {});
+      }
+      return;
+    }
+
+    if (!ARCHIVE_CHANNEL_IDS.includes(chId)) return;
     await insertArchiveMessage(supabase, message, mediaBackupCfg);
+
+    if (!message.author.bot && ARCHIVE_POSTLINK_6VID_CHANNEL_IDS.has(chId)) {
+      try {
+        const base = String(SITE_BASE || "").replace(/\/$/, "");
+        const postUrl = `${base}/archive/post/${encodeURIComponent(chId)}/${encodeURIComponent(String(message.id))}`;
+        await message.reply({ content: `**Archived:** ${postUrl}` });
+      } catch (e) {
+        console.warn("[archive] post-link reply failed:", e.message);
+      }
+    }
   });
 
   const defaultIntervalMs = Math.max(60 * 1000, NUKE_INTERVAL_MS || 24 * 60 * 60 * 1000);
