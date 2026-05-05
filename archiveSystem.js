@@ -768,6 +768,52 @@ async function insertArchiveMessage(supabase, message, mediaCfg = null) {
   if (error) console.warn("[archive] log message failed:", error.message);
 }
 
+/** #general — nuke keeps only the last hour of chat here; other archive channels are fully cleared. */
+const ARCHIVE_GENERAL_CHANNEL_ID = "1498122216800522261";
+
+/** Delete a set of messages using bulk rules when &lt;14d, else one-by-one. */
+async function deleteMessagesWithDiscordAgeRules(channel, messages) {
+  const arr = [...messages];
+  if (!arr.length) return;
+  const twoWeeks = Date.now() - 14 * 24 * 60 * 60 * 1000;
+  const recent = arr.filter((m) => m.createdTimestamp > twoWeeks);
+  const old = arr.filter((m) => m.createdTimestamp <= twoWeeks);
+  try {
+    if (recent.length > 1) {
+      await channel.bulkDelete(recent, true);
+    } else if (recent.length === 1) {
+      await recent[0].delete().catch(() => {});
+    }
+  } catch {
+    for (const m of recent) await m.delete().catch(() => {});
+  }
+  for (const m of old) {
+    await m.delete().catch(() => {});
+    await sleep(350);
+  }
+}
+
+/**
+ * Delete only messages older than `preserveRecentMs`; keep the newest window in the channel.
+ * Pages backward with `before` so deep history is cleared.
+ */
+async function purgeChannelMessagesKeepingRecent(channel, preserveRecentMs) {
+  const cutoff = Date.now() - preserveRecentMs;
+  let before = undefined;
+  let safety = 0;
+  while (safety++ < 5000) {
+    const batch = await channel.messages.fetch({ limit: 100, before }).catch(() => null);
+    if (!batch || batch.size === 0) break;
+    const sorted = [...batch.values()].sort((a, b) => b.createdTimestamp - a.createdTimestamp);
+    const oldest = sorted[sorted.length - 1];
+    const oldestId = oldest.id;
+    const toDelete = sorted.filter((m) => m.createdTimestamp < cutoff);
+    if (toDelete.length) await deleteMessagesWithDiscordAgeRules(channel, toDelete);
+    before = oldestId;
+    if (batch.size < 100) break;
+  }
+}
+
 /** Purge channel: bulk-delete when &lt;14d; older messages one-by-one. */
 async function purgeChannelMessages(channel) {
   let safety = 0;
@@ -794,8 +840,23 @@ async function purgeChannelMessages(channel) {
   }
 }
 
-function buildNukeEmbed(siteBase) {
+function buildNukeEmbed(siteBase, generalLastHour = false) {
   const url = `${siteBase.replace(/\/$/, "")}/archive`;
+  if (generalLastHour) {
+    return new EmbedBuilder()
+      .setTitle("Older messages removed (#general)")
+      .setColor(0x3ba55d)
+      .setDescription(
+        "The **last hour** of chat stays in this channel. Older messages were deleted. Full history on **6xs.lol**.",
+      )
+      .addFields({
+        name: "View history",
+        value: `[**Open 6xs archives →**](${url})`,
+        inline: false,
+      })
+      .setFooter({ text: "6xs · member-only archive · stay in the server to access" })
+      .setTimestamp();
+  }
   return new EmbedBuilder()
     .setTitle("Channel cleared")
     .setColor(0x3ba55d)
@@ -815,8 +876,14 @@ async function postNukeEmbedAndOptionallyPurge(bot, channelId, siteBase, doPurge
     console.warn(`[archive] cannot fetch channel ${channelId}`);
     return;
   }
-  if (doPurge) await purgeChannelMessages(ch);
-  const embed = buildNukeEmbed(siteBase);
+  if (doPurge) {
+    if (String(channelId) === ARCHIVE_GENERAL_CHANNEL_ID) {
+      await purgeChannelMessagesKeepingRecent(ch, 60 * 60 * 1000);
+    } else {
+      await purgeChannelMessages(ch);
+    }
+  }
+  const embed = buildNukeEmbed(siteBase, String(channelId) === ARCHIVE_GENERAL_CHANNEL_ID);
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setLabel("View archives on 6xs.lol").setStyle(ButtonStyle.Link).setURL(`${siteBase.replace(/\/$/, "")}/archive`)
   );
