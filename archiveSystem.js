@@ -2355,6 +2355,36 @@ function attachArchiveSystem(deps) {
     });
   });
 
+  app.get("/api/archive/:channelId/live", requireArchiveMember, async (req, res) => {
+    const channelId = String(req.params.channelId || "");
+    if (!ARCHIVE_CHANNEL_IDS.includes(channelId)) return res.status(404).json({ error: "unknown channel" });
+
+    const limit = Math.min(60, Math.max(1, parseInt(req.query.limit || "20", 10) || 20));
+    const hideBots = String(req.query.hide_bots || "") === "1";
+    const mediaOnly = String(req.query.media_only || "") === "1";
+    const afterCreatedAtRaw = String(req.query.after_created_at || "").trim();
+    if (!afterCreatedAtRaw || Number.isNaN(Date.parse(afterCreatedAtRaw))) {
+      return res.json({ rows: [], limit });
+    }
+    const afterCreatedAt = new Date(afterCreatedAtRaw).toISOString();
+
+    let qb = supabase
+      .from("archive_messages")
+      .select("*")
+      .eq("channel_id", channelId)
+      .gte("created_at_discord", afterCreatedAt)
+      .order("created_at_discord", { ascending: true })
+      .limit(limit);
+    if (hideBots) qb = qb.eq("author_is_bot", false);
+    const { data, error } = await qb;
+    if (error) return res.status(500).json({ error: error.message });
+    const out = (data || []).filter((r) => (mediaOnly ? rowHasMedia(r) : true));
+    res.json({
+      rows: out.map((r) => normalizeArchiveMessageRow(r, mediaCdnBase, mediaBackupCfg.bucket)),
+      limit,
+    });
+  });
+
   app.get("/api/archive/:channelId/:messageId", requireArchiveMember, async (req, res) => {
     const channelId = String(req.params.channelId || "");
     const messageId = String(req.params.messageId || "");
@@ -2856,6 +2886,9 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId, me
     let exhausted = false;
     let totalKnown = null;
     let io = null;
+    let liveTimer = null;
+    let liveInFlight = false;
+    let newestCreatedAt = "";
 
     const tabs = document.getElementById("tabs");
     const filters = document.getElementById("filters");
@@ -2924,9 +2957,82 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId, me
       mediaBeforeMessageId = null;
       exhausted = false;
       totalKnown = null;
+      newestCreatedAt = "";
       feed.innerHTML = '<p class="loading">Loading…</p>';
       sentinelMsg.style.display = "none";
       loadPage(true);
+    }
+
+    function existingMessageIdSet() {
+      var set = new Set();
+      var nodes = feed.querySelectorAll(".msg[data-mid]");
+      for (var i = 0; i < nodes.length; i++) {
+        var id = String(nodes[i].dataset.mid || "");
+        if (id) set.add(id);
+      }
+      return set;
+    }
+
+    function updateNewestCursor(rows) {
+      if (!Array.isArray(rows) || !rows.length) return;
+      for (var i = 0; i < rows.length; i++) {
+        var ts = String(rows[i] && rows[i].created_at_discord ? rows[i].created_at_discord : "");
+        if (ts && (!newestCreatedAt || ts > newestCreatedAt)) newestCreatedAt = ts;
+      }
+    }
+
+    function liveEnabled() {
+      if (!active) return false;
+      if (!newestCreatedAt) return false;
+      if (document.getElementById("f-q").value.trim()) return false;
+      if (document.getElementById("f-author-id").value.trim()) return false;
+      if (document.getElementById("f-author").value.trim()) return false;
+      if (document.getElementById("f-from").value) return false;
+      if (document.getElementById("f-to").value) return false;
+      if (document.getElementById("f-mentions").value.trim()) return false;
+      return true;
+    }
+
+    async function pollLiveRows() {
+      if (liveInFlight || loading || !liveEnabled()) return;
+      liveInFlight = true;
+      try {
+        var p = new URLSearchParams();
+        p.set("after_created_at", newestCreatedAt);
+        p.set("limit", "25");
+        if (document.getElementById("f-hide-bots").checked) p.set("hide_bots", "1");
+        if (viewMode === "media") p.set("media_only", "1");
+        var r = await fetch("/api/archive/" + active + "/live?" + p.toString());
+        if (!r.ok) return;
+        var j = await r.json();
+        var rows = Array.isArray(j.rows) ? j.rows : [];
+        if (!rows.length) return;
+        updateNewestCursor(rows);
+        var seen = existingMessageIdSet();
+        var added = 0;
+        for (var i = 0; i < rows.length; i++) {
+          var row = rows[i] || {};
+          var mid = String(row.message_id || "");
+          if (!mid || seen.has(mid)) continue;
+          seen.add(mid);
+          if (feed.firstElementChild && feed.firstElementChild.classList && feed.firstElementChild.classList.contains("loading")) {
+            feed.innerHTML = "";
+          }
+          var node = viewMode === "media" ? renderMediaCard(row) : renderMessage(row);
+          feed.prepend(node);
+          added += 1;
+        }
+        if (added) {
+          updateStats(feed.querySelectorAll(".msg").length);
+        }
+      } finally {
+        liveInFlight = false;
+      }
+    }
+
+    function setupLivePolling() {
+      if (liveTimer) clearInterval(liveTimer);
+      liveTimer = setInterval(pollLiveRows, 5000);
     }
 
     async function loadPage(isFirst) {
@@ -2976,6 +3082,7 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId, me
         for (var i = 0; i < rows.length; i++) {
           feed.appendChild(viewMode === "media" ? renderMediaCard(rows[i]) : renderMessage(rows[i]));
         }
+        updateNewestCursor(rows);
 
         if (viewMode === "media") {
           mediaBeforeMessageId = j.next_before_message_id || null;
@@ -3118,6 +3225,7 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId, me
     function renderMediaCard(row) {
       var div = document.createElement("div");
       div.className = "msg";
+      if (row.message_id) div.dataset.mid = String(row.message_id);
       var when = row.created_at_discord ? new Date(row.created_at_discord).toLocaleString() : "";
       var nameStyle = displayNameStyle(normalizeAuthorRoles(row.author_roles));
       var body = renderAttachments(row.attachments);
@@ -3520,6 +3628,7 @@ function archiveShellHtml(siteBase, user, channelIds, labels, mediaChannelId, me
     syncModeButtons();
     resetAndLoad();
     setupObserver();
+    setupLivePolling();
   </script>
 </body>
 </html>`;
